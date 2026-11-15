@@ -1,0 +1,87 @@
+# --- 目标芯片 ---
+CONFIG_IDF_TARGET="esp32c3"
+# 注:ESP32-C3 无 PSRAM,故不设 CONFIG_SPIRAM。
+
+# --- Flash ---
+# FoloToy AI Passport 当前产品/固件基线使用 8MB Flash。
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+# 固定 8MB 镜像头，关闭 detect，便于 idf.py merge-bin。
+CONFIG_ESPTOOLPY_HEADER_FLASHSIZE_UPDATE=n
+# 默认模板只保留 NVS、PHY data 和占用剩余空间的 factory app；用户可按需修改。
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+CONFIG_PARTITION_TABLE_FILENAME="partitions.csv"
+
+# --- 控制台:USB-Serial-JTAG(C3 原生 USB,GPIO18/19)---
+# 不用 UART0:其默认 TX=GPIO21 与本板背光引脚冲突。
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_SECONDARY_NONE=y
+
+# --- LVGL ---
+CONFIG_LV_COLOR_DEPTH_16=y
+# 20 ms display refresh period targets up to 50 FPS when rendering and SPI
+# transfer complete within the same budget.
+CONFIG_LV_DEF_REFR_PERIOD=20
+CONFIG_LV_FONT_MONTSERRAT_14=y
+CONFIG_LV_FONT_MONTSERRAT_20=y
+# 中文缺字必须可见（方框），便于发现字库覆盖缺口；禁用只会把缺字变成空白。
+CONFIG_LV_USE_FONT_PLACEHOLDER=y
+# LVGL 分配器：默认改用系统堆的标准 malloc/realloc/free。
+# 内置 24KB 静态池在复杂圆角/蒙版绘制时会耗尽，lv_malloc 返回 NULL 后 LVGL 断言死循环，
+# 饿死 IDLE 触发 TWDT 冻屏（真机已复现：圆角蒙版表分配失败）。系统堆约 130KB 可用，
+# 不会占用额外静态区；仍可按需改回内置池并调 CONFIG_LV_MEM_SIZE_KILOBYTES。
+CONFIG_LV_USE_CLIB_MALLOC=y
+
+# --- 系统 ---
+CONFIG_FREERTOS_HZ=1000
+
+# --- Bluetooth LE ---
+# 电子书阅读器不使用 BLE。关闭 NimBLE 以释放内部 RAM，留给 Wi-Fi SoftAP、
+# HTTP 服务与 LVGL（本板无 PSRAM）。
+CONFIG_BT_ENABLED=n
+
+# --- 应用资源 ---
+# 传书页需要额外的事件循环栈；主任务在启动时完成 NVS/SPIFFS 初始化。
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# --- 体积（功能优先，仅裁剪确定不用的部分）---
+# 尺寸优先编译：阅读器没有实时性要求，-Os 换来的 Flash 全部让给字库与书库。
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+# 只保留 WARN 及以上日志；INFO 级文案在发布镜像里没有用处。
+CONFIG_LOG_DEFAULT_LEVEL_WARN=y
+# LVGL 示例/演示代码从不被调用，之前却被编进了固件。
+CONFIG_LV_BUILD_EXAMPLES=n
+CONFIG_LV_BUILD_DEMOS=n
+# 只保留本应用真正用到的控件（obj / label / image + 主题 + flex/grid）。
+# reader_ui.c 全部界面由 lv_obj + lv_label + 自绘矩形组成，其余控件无任何引用。
+CONFIG_LV_USE_ANIMIMG=n
+CONFIG_LV_USE_ARC=n
+CONFIG_LV_USE_BAR=n
+CONFIG_LV_USE_BUTTON=n
+CONFIG_LV_USE_BUTTONMATRIX=n
+CONFIG_LV_USE_CALENDAR=n
+CONFIG_LV_USE_CANVAS=n
+CONFIG_LV_USE_CHART=n
+CONFIG_LV_USE_CHECKBOX=n
+CONFIG_LV_USE_DROPDOWN=n
+CONFIG_LV_USE_IMAGEBUTTON=n
+CONFIG_LV_USE_KEYBOARD=n
+CONFIG_LV_USE_LED=n
+CONFIG_LV_USE_LINE=n
+CONFIG_LV_USE_LIST=n
+CONFIG_LV_USE_MENU=n
+CONFIG_LV_USE_MSGBOX=n
+CONFIG_LV_USE_ROLLER=n
+CONFIG_LV_USE_SCALE=n
+CONFIG_LV_USE_SLIDER=n
+CONFIG_LV_USE_SPAN=n
+CONFIG_LV_USE_SPINBOX=n
+CONFIG_LV_USE_SPINNER=n
+CONFIG_LV_USE_SWITCH=n
+CONFIG_LV_USE_TABLE=n
+CONFIG_LV_USE_TABVIEW=n
+CONFIG_LV_USE_TILEVIEW=n
+CONFIG_LV_USE_WIN=n

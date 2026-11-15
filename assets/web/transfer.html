@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>掌小读 · 传书</title>
+<style>
+:root{--ink:#2f2a24;--paper:#f6efe0;--accent:#8a3b2a;--line:#d8cbb2;--ok:#3f6c93;--warn:#a05a1c}
+*{box-sizing:border-box}
+body{margin:0;padding:16px;background:#e9e2d3;color:var(--ink);
+ font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif}
+.card{max-width:520px;margin:0 auto;background:var(--paper);border:1px solid var(--line);
+ border-radius:14px;padding:20px;box-shadow:0 4px 18px rgba(0,0,0,.08)}
+h1{font-size:20px;margin:0 0 6px}h2{font-size:15px;margin:22px 0 8px}
+.hint{font-size:12px;line-height:1.7;color:#6b6152;margin:8px 0}
+.space{border:1px solid var(--line);border-radius:10px;padding:14px;margin:16px 0;background:#fffdf7}
+.label{font-size:12px;color:#6b6152}
+.big{font-size:30px;font-weight:700;color:var(--accent);margin:4px 0 2px}
+.small{font-size:12px;color:#6b6152}
+.bar{height:8px;background:#e6dcc6;border-radius:4px;overflow:hidden;margin-top:10px}
+.bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .3s}
+input[type=file]{display:block;width:100%;font-size:14px;margin:10px 0;padding:10px;
+ border:1px dashed var(--line);border-radius:8px;background:#fff}
+button{width:100%;padding:12px;font-size:15px;border:0;border-radius:8px;
+ background:var(--accent);color:#fff;font-weight:600}
+button:disabled{opacity:.5}
+button.ghost{width:auto;padding:6px 12px;font-size:12px;background:transparent;
+ color:var(--accent);border:1px solid var(--accent);font-weight:400}
+#msg{font-size:13px;margin-top:10px;min-height:20px;line-height:1.6}
+#enc{font-size:12px;line-height:1.7;margin:0 0 8px;padding:9px 11px;border-radius:8px;
+ border:1px solid var(--line);background:#fffdf7;display:none}
+#enc.show{display:block}
+.ok{color:var(--ok)}.warn{color:var(--warn)}
+#enc a,.convert a{color:var(--accent)}
+.convert{border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin:16px 0;
+ background:#fffdf7;font-size:12px;line-height:1.8;color:#5c5346}
+.convert.highlight{border-color:var(--warn);box-shadow:0 0 0 3px rgba(160,90,28,.12)}
+.convert h3{font-size:13px;margin:0 0 6px;color:var(--ink)}
+.state{font-size:12px;line-height:1.7;color:#3a342b;background:#fff;border:1px solid var(--line);
+ border-radius:8px;padding:9px 11px;margin:6px 0}
+#encPreview{white-space:pre-wrap;word-break:break-all;font-size:12px;line-height:1.6;
+ background:#fff;border:1px solid var(--line);border-radius:8px;padding:9px 11px;margin:8px 0 0;
+ max-height:150px;overflow:auto;color:#3a342b}
+ul{list-style:none;padding:0;margin:0}
+li{display:flex;justify-content:space-between;align-items:center;gap:8px;
+ padding:9px 2px;border-bottom:1px solid var(--line);font-size:13px}
+li span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+li a{color:var(--accent);text-decoration:none;font-size:12px;flex-shrink:0}
+.tag{font-size:11px;color:#6b6152;flex-shrink:0}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>掌小读 · 传书</h1>
+  <p class="hint">手机已连接设备热点。选择纯文本 .txt 文件即可上传；页面会自动检测编码，GBK / ANSI 会在此页自动转换为 UTF-8，不必先到电脑上另存。上传过程请保持页面打开。</p>
+
+  <div class="space">
+    <div class="label">剩余存储空间</div>
+    <div class="big" id="free">读取中…</div>
+    <div class="small" id="detail"></div>
+    <div class="bar"><i id="bar"></i></div>
+  </div>
+
+  <form id="form">
+    <input type="file" id="file" accept=".txt,text/plain" required>
+    <div id="enc"></div>
+    <button type="submit" id="submit">上传并加入书架</button>
+  </form>
+  <div id="msg"></div>
+
+  <div class="convert" id="convert">
+    <h3>编码检测与转换工具</h3>
+    <div id="encState" class="state">选择 .txt 文件后，这里会显示编码检测结果。</div>
+    <button type="button" id="previewBtn" class="ghost" style="display:none">查看转换后文本预览</button>
+    <pre id="encPreview" style="display:none"></pre>
+    <p class="hint" style="margin-bottom:0">选择文件后，本页先读取字节：能用 UTF-8 严格解码就按 UTF-8 上传；否则按 GBK 解码、重新编码为 UTF-8 后再上传，同时去掉 BOM、把 CRLF 统一为 LF。<br>
+    设备热点下没有外网，跳转到外部网站会打不开，所以本页就是那个「能转编码的网页」；检测到非 UTF-8 时会自动带你到这里并高亮，转换零操作、无需手动另存。<br>
+    万一浏览器不支持自动转换，请在电脑上用记事本或 VS Code 打开 txt，选「另存为 UTF-8」后再上传。设备端仍按收到的字节原样保存，不会去水印、去段首缩进或改动正文。</p>
+  </div>
+
+  <h2>书架上的书籍</h2>
+  <ul id="list"><li><span>读取中…</span></li></ul>
+
+  <p class="hint">界面与内置书使用随固件编译的中文字库，常用简体汉字（GB2312 一级）与标点可直接显示；生僻字会显示为方框，上传完成后会提示数量。<br>
+  重新刷写 0x0 完整固件会清空已上传的书籍，内置示例书始终保留。</p>
+</div>
+<script>
+function fmtSize(b){
+  if(b>=1048576) return (b/1048576).toFixed(2)+' MB';
+  if(b>=1024) return (b/1024).toFixed(1)+' KB';
+  return b+' B';
+}
+function esc(s){return String(s).replace(/[&<>"]/g,function(c){
+  return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function refresh(){
+  fetch('/space').then(function(r){return r.json();}).then(function(d){
+    document.getElementById('free').textContent=fmtSize(d.free);
+    document.getElementById('detail').textContent=
+      '总计 '+fmtSize(d.total)+'　已用 '+fmtSize(d.used)+'　共 '+d.files+' 本上传书籍';
+    var pct=d.total?Math.round(d.used*100/d.total):0;
+    document.getElementById('bar').style.width=pct+'%';
+  }).catch(function(){});
+  fetch('/list').then(function(r){return r.json();}).then(function(d){
+    var ul=document.getElementById('list');ul.innerHTML='';
+    if(!d.length){ul.innerHTML='<li><span>（暂无上传书籍）</span></li>';return;}
+    d.forEach(function(b){
+      var li=document.createElement('li');
+      li.innerHTML='<span>'+esc(b.name)+'</span><span class="tag">'+fmtSize(b.size)+'</span>'+
+        '<a href="/delete?name='+encodeURIComponent(b.name)+'">删除</a>';
+      ul.appendChild(li);
+    });
+  }).catch(function(){});
+}
+
+// ---- 编码检测与转换 -------------------------------------------------------
+// 设备 /upload 是 raw POST body，前端把转码后的 UTF-8 Blob 直接作为 body 即可，
+// 设备端无需改动。GBK 由浏览器原生 TextDecoder 解码（Encoding Standard 要求
+// 所有浏览器支持 gbk 解码），转成 UTF-8 文本后由 Blob 重新编码为 UTF-8 字节。
+var pendingBlob = null;
+var gConvertedText = null;
+
+function detect(buf){
+  var b = new Uint8Array(buf);
+  if(b.length>=3 && b[0]===0xEF && b[1]===0xBB && b[2]===0xBF) return 'utf8-bom';
+  if(typeof TextDecoder === 'undefined'){
+    // 老浏览器兜底：按字节粗判 UTF-8 前导序列，遇到非法字节视为 GBK。
+    var i=0;
+    while(i<b.length){
+      var c=b[i];
+      if(c<0x80){i++;continue;}
+      if(c>=0xC2&&c<=0xDF&&i+1<b.length&&(b[i+1]&0xC0)===0x80){i+=2;continue;}
+      if(c>=0xE0&&c<=0xEF&&i+2<b.length&&(b[i+1]&0xC0)===0x80&&(b[i+2]&0xC0)===0x80){i+=3;continue;}
+      if(c>=0xF0&&c<=0xF4&&i+3<b.length){i+=4;continue;}
+      return 'gbk';
+    }
+    return 'utf8';
+  }
+  try{ new TextDecoder('utf-8',{fatal:true}).decode(b); return 'utf8'; }
+  catch(e){ return 'gbk'; }
+}
+
+function toUtf8Blob(buf,enc){
+  if(typeof TextDecoder === 'undefined') return null;
+  var b=new Uint8Array(buf),text;
+  try{
+    text = enc==='gbk' ? new TextDecoder('gbk').decode(b)
+                       : new TextDecoder('utf-8').decode(b);
+  }catch(e){ return null; }
+  text = text.replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
+  gConvertedText = text;
+  return new Blob([text],{type:'text/plain;charset=utf-8'});
+}
+
+var encBox=document.getElementById('enc');
+var encState=document.getElementById('encState');
+var previewBtn=document.getElementById('previewBtn');
+function showEnc(html){ encBox.innerHTML=html; encBox.className='show'; }
+function setState(html){ encState.innerHTML=html; }
+function highlightGuide(on,jump){
+  var box=document.getElementById('convert');
+  box.className = on?'convert highlight':'convert';
+  // 检测到非 UTF-8 时把用户"重定向"到本页这个能转编码的工具区。
+  if(on&&jump&&box.scrollIntoView) box.scrollIntoView({behavior:'smooth',block:'nearest'});
+}
+function resetPreview(){
+  gConvertedText=null; previewBtn.style.display='none';
+  previewBtn.textContent='查看转换后文本预览';
+  document.getElementById('encPreview').style.display='none';
+}
+previewBtn.addEventListener('click',function(){
+  var pre=document.getElementById('encPreview');
+  if(pre.style.display==='none'){
+    var t=gConvertedText||'';
+    pre.textContent=t.slice(0,300)+(t.length>300?'\n…（仅显示前 300 字）':'');
+    pre.style.display='block'; this.textContent='收起预览';
+  }else{ pre.style.display='none'; this.textContent='查看转换后文本预览'; }
+});
+
+document.getElementById('file').addEventListener('change',function(){
+  var f=this.files[0];
+  pendingBlob=null; encBox.className=''; encBox.innerHTML='';
+  highlightGuide(false,false); resetPreview();
+  setState('选择 .txt 文件后，这里会显示编码检测结果。');
+  if(!f) return;
+  if(f.size>524288){ showEnc('<span class="warn">文件超过 512 KB，无法上传。</span>');
+    setState('<span class="warn">文件超过 512 KB。</span>'); return; }
+  setState('正在检测编码…');
+  var reader=new FileReader();
+  reader.onload=function(e){
+    var enc=detect(e.target.result);
+    var srcSize=f.size;
+    if(enc==='utf8'||enc==='utf8-bom'){
+      pendingBlob=toUtf8Blob(e.target.result,enc)||f;
+      var out=pendingBlob.size;
+      showEnc('<span class="ok">✓ 检测到 UTF-8 编码'+
+        (enc==='utf8-bom'?'（含 BOM，将自动去除）':'')+'</span>，可直接上传。');
+      setState('<span class="ok">✓ UTF-8 编码，无需转换。</span> 原文件 '+fmtSize(srcSize)+
+        ' → 上传 '+fmtSize(out)+'（已去除 BOM / 统一换行）。');
+      previewBtn.style.display=gConvertedText?'inline-block':'none';
+    }else{
+      var blob=toUtf8Blob(e.target.result,'gbk');
+      if(!blob){
+        showEnc('<span class="warn">检测到 GBK / ANSI 编码，但当前浏览器无法自动转换。</span>请另存为 UTF-8 后再上传，<a href="#convert">查看方法</a>。');
+        setState('<span class="warn">⚠ 检测到 GBK / ANSI 编码，当前浏览器无法自动转换。</span>请在电脑上另存为 UTF-8 后再上传。');
+        highlightGuide(true,true); return;
+      }
+      pendingBlob=blob;
+      var out2=blob.size;
+      var pct=srcSize?Math.round((out2-srcSize)*100/srcSize):0;
+      showEnc('<span class="warn">检测到 GBK / ANSI 编码</span>：已在本页自动转换为 UTF-8（'+
+        fmtSize(out2)+'），直接上传即可，无需手动另存。<a href="#convert">查看转换详情</a>');
+      setState('<span class="warn">⚠ 检测到 GBK / ANSI 编码，已自动转换为 UTF-8。</span> 原文件 '+
+        fmtSize(srcSize)+' → 上传 '+fmtSize(out2)+'（'+(pct>=0?'+':'')+pct+'%）。下面可预览转换结果。');
+      previewBtn.style.display='inline-block';
+      highlightGuide(true,true);
+    }
+    if(pendingBlob && pendingBlob.size>524288){
+      showEnc('<span class="warn">转换为 UTF-8 后超过 512 KB（'+
+        fmtSize(pendingBlob.size)+'）</span>，请精简文本后重试。');
+      setState('<span class="warn">转换为 UTF-8 后超过 512 KB 上传上限。</span> 请精简文本，或删除部分内容后重试。');
+      pendingBlob=null; resetPreview();
+    }
+  };
+  reader.onerror=function(){ showEnc('<span class="warn">文件读取失败，请重试。</span>');
+    setState('<span class="warn">文件读取失败，请重试。</span>'); };
+  reader.readAsArrayBuffer(f);
+});
+
+document.getElementById('form').addEventListener('submit',function(e){
+  e.preventDefault();
+  var f=document.getElementById('file').files[0];
+  var msg=document.getElementById('msg');
+  var btn=document.getElementById('submit');
+  if(!f){msg.textContent='请先选择文件';return;}
+  if(!pendingBlob){msg.textContent='编码尚未处理完成，或该文件需要转换但无法转换，请稍候或重新选择文件';return;}
+  var body=pendingBlob;
+  if(body.size>524288){msg.textContent='文件过大，上限 512 KB';return;}
+  btn.disabled=true;msg.textContent='正在上传 '+esc(f.name)+' …';
+  fetch('/upload?name='+encodeURIComponent(f.name),{method:'POST',body:body})
+    .then(function(r){return r.json();}).then(function(d){
+      msg.textContent=d.ok?('已保存 '+esc(d.name)+'（'+fmtSize(d.size)+'）'+
+        (d.unsupported?('，其中 '+d.unsupported+' 个生僻字可能显示为方框'):'，字符全部受支持'))
+        :('上传失败：'+esc(d.error||'未知错误'));
+      btn.disabled=false;refresh();
+    }).catch(function(err){msg.textContent='上传出错：'+err;btn.disabled=false;refresh();});
+});
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>

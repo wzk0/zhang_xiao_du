@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,   Size,     Flags
+# Minimal baseline + one SPIFFS partition for books uploaded over the local AP.
+# A merged 0x0 flash leaves "books" blank; reader_store_init() formats it on
+# first boot. See docs/development/engineering/firmware-layout.md.
+#
+# The app is the nine-size Chinese font set (~2.1 MiB) plus ~1.5 MiB of Wi-Fi and
+# LVGL code: 3.59 MiB with -Os. factory stays at 4 MiB, which leaves ~430 KiB of
+# headroom for future features while every remaining byte goes to the book store
+# (3.94 MiB, up from 3.44 MiB).
+nvs,      data, nvs,     0x9000,   0x6000,
+phy_init, data, phy,     0xf000,   0x1000,
+factory,  app,  factory, 0x10000,  0x400000,
+books,    data, spiffs,  0x410000, 0x3f0000,
