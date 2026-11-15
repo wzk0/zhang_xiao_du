@@ -50,8 +50,12 @@ static void format_count(size_t n, char *buf, size_t size)
 
 int reader_storage_hint(size_t free_bytes, char *out, size_t out_size)
 {
-    if (!out || out_size < 16) return -1;
+    if (!out || out_size == 0) return -1;
+    // Always leave a valid empty string behind, even when the buffer is too
+    // small for the shortest hint. Returning before this line would leave the
+    // caller's bytes untouched, making the result depend on the stack.
     out[0] = '\0';
+    if (out_size < 16) return -1;
 
     if (free_bytes == 0) {
         snprintf(out, out_size, "%s", "空间已满，先删除旧书再传新书");

@@ -16,5 +16,7 @@ int reader_storage_percent(size_t part, size_t total);
 // `free_bytes`. The reference work is picked from a small table of well-known
 // titles according to how much space is left, so the numbers stay meaningful.
 // Returns the byte count written (0 only on invalid arguments), or -1 when the
-// buffer is too small.
+// buffer is too small. Any non-NULL buffer with out_size > 0 is always left as
+// a valid NUL-terminated string, including the too-small and invalid-argument
+// paths, so callers can safely use it as an empty caption.
 int reader_storage_hint(size_t free_bytes, char *out, size_t out_size);

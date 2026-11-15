@@ -32,6 +32,9 @@ static void test_hint_bounds(void)
     char out[128];
     CHECK(reader_storage_hint(0, NULL, 0) == -1);
     char tiny[8];
+    // Seed with non-zero bytes. The assertion below must prove that the callee
+    // terminates the buffer, not that a clean stack happens to start with 0.
+    memset(tiny, 'X', sizeof(tiny));
     CHECK(reader_storage_hint(1000, tiny, sizeof(tiny)) == -1);
     CHECK(tiny[0] == '\0');
     CHECK(reader_storage_hint(0, out, sizeof(out)) > 0);
