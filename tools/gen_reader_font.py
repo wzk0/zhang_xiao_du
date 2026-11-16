@@ -6,8 +6,8 @@ Why an in-repo generator instead of lv_font_conv
 -------------------------------------------------
 The pinned LVGL version reads PLAIN bitmap fonts (bitmap_format = 0).  The
 published lv_font_conv 1.5.3 produced corrupted glyph bitmaps under the Node.js
-available here (bitmap_index values pointed past the end of the array), which is
-also recorded in docs/reference/shinku-chen/lvgl-cjk-font-subsets.md.  Rendering
+available here (bitmap_index values pointed past the end of the array), which
+is also why the padding/inventory gates below exist.  Rendering
 with Pillow/FreeType and emitting the LVGL structures directly removes that
 toolchain from the trust path, and ``--verify`` re-parses the emitted C file and
 compares every glyph, pixel by pixel, against the rasterisation that produced it.
@@ -92,7 +92,7 @@ Character inventory
 
 Uploaded book text is dynamic: characters outside this inventory are counted at
 upload time and reported as unsupported instead of being silently dropped.  See
-docs/development/engineering/lvgl-chinese-fonts.md for the coverage contract.
+the font rule in AGENTS.md for the coverage contract.
 
 The generated .c files, charset.txt and cjk_strikes.txt are committed; the
 source TTF/TTC and the original PCF fonts are not. Font sources:
@@ -155,6 +155,10 @@ COMMON_SYMBOLS = (
 )
 
 SOURCE_GLOBS = ("main/*.c", "main/*.h")
+# Built-in book text now lives as canonical UTF-8 files (compressed to zdx at
+# build time). They must stay in the font inventory or rare characters would
+# turn into tofu after the C literals are removed.
+BOOK_TEXT_GLOB = "assets/books/*.txt"
 STRING_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
 
 
@@ -173,7 +177,7 @@ def gb2312_level1() -> list[str]:
 
 
 def source_literal_chars() -> set[str]:
-    """Collect non-ASCII characters from C string literals (UI text + books)."""
+    """Collect non-ASCII characters from C string literals and book text."""
     found: set[str] = set()
     for pattern in SOURCE_GLOBS:
         for path in sorted(ROOT.glob(pattern)):
@@ -184,6 +188,10 @@ def source_literal_chars() -> set[str]:
                 for ch in cleaned:
                     if ord(ch) > 0x7F:
                         found.add(ch)
+    for path in sorted(ROOT.glob(BOOK_TEXT_GLOB)):
+        for ch in path.read_text(encoding="utf-8"):
+            if ord(ch) > 0x7F:
+                found.add(ch)
     return found
 
 

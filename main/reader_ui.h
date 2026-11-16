@@ -83,12 +83,14 @@ void reader_ui_render_font_picker(int font_size, const char *battery);
 // shelf is a second key press.
 void reader_ui_render_finished(const char *book_title);
 // Title card (page 0): same centred typography as the 完 page, but the large
-// word is the book's title and the subtitle is "N字 · X KB" computed from the
-// book itself. Rendered before the chapter index is built, so the reader sees
-// something during the load pause; char_count may be 0 in that first frame.
-// Pressing UP on the first text page comes back here, and DOWN/OK resumes.
+// word is the book's title and the subtitle is "N字 · X KB". `flash_bytes` is
+// the compressed on-flash footprint (not the uncompressed byte length used for
+// progress), so the number matches the shelf's "X KB" size display. Rendered
+// before the chapter index is built, so the reader sees something during the
+// load pause; char_count may be 0 in that first frame. Pressing UP on the first
+// text page comes back here, and DOWN/OK resumes.
 void reader_ui_render_cover(const char *book_title, size_t char_count,
-                            size_t book_bytes);
+                            size_t flash_bytes);
 // Destructive-action confirmation (delete a bookmark or a book). `question`
 // is the short prompt, `item` the name/excerpt of what would be removed.
 void reader_ui_render_confirm(const char *question, const char *item,

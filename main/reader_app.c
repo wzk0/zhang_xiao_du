@@ -56,7 +56,11 @@ typedef struct {
     // are books, row count is the pinned settings action), and the title is
     // also needed on the "完" page after the reader has left the shelf.
     char current_title[READER_BOOK_TITLE_MAX];
+    // Progress/offset space: the ORIGINAL UTF-8 byte length (uncompressed).
     uint32_t book_size;
+    // Flash footprint of the compressed book file — shown on the title card
+    // so it matches the shelf's "内置示例 · X KB" footprint display.
+    uint32_t book_flash_size;
     // Non-whitespace code points, filled by reader_store_build_index() in the
     // same streaming pass that finds chapters; feeds the title-card subtitle.
     size_t book_chars;
@@ -339,8 +343,10 @@ static void render_screen_locked(void)
         reader_ui_render_finished(s_state.current_title);
         break;
     case READER_SCREEN_COVER:
+        // The title card shows the compressed footprint on flash, not the
+        // uncompressed byte length used for progress/offset arithmetic.
         reader_ui_render_cover(s_state.current_title, s_state.book_chars,
-                               s_state.book_size);
+                               s_state.book_flash_size);
         break;
     case READER_SCREEN_STORAGE: {
         space_snapshot(&total, &used, &free_b);
@@ -502,7 +508,12 @@ static void open_book(int list_index)
     reader_book_info_t *b = &s_state.books[book_idx];
     snprintf(s_state.current_id, sizeof(s_state.current_id), "%s", b->id);
     snprintf(s_state.current_title, sizeof(s_state.current_title), "%s", b->title);
-    s_state.book_size = b->size;
+    // Progress is measured in ORIGINAL UTF-8 byte offsets (bookmarks and
+    // chapter offsets use the same space), so progress metrics must use the
+    // uncompressed length. The title card, however, shows the real on-flash
+    // footprint of the compressed book — keep the two values separate.
+    s_state.book_size = b->orig_size ? b->orig_size : b->size;
+    s_state.book_flash_size = b->size;
     s_state.book_chars = 0;
     s_state.selected = list_index;
     history_reset();

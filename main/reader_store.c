@@ -6,6 +6,7 @@
 #include "reader_fonts.h"
 #include "reader_progress.h"
 #include "reader_text.h"
+#include "reader_zdx.h"
 
 #include "dirent.h"
 #include "esp_log.h"
@@ -48,9 +49,69 @@ static void lock_init(void)
     if (!s_upload_lock) s_upload_lock = xSemaphoreCreateMutex();
 }
 
+#define BOOK_EXT ".zdx"
+
 static void book_path(const char *id, char *out, size_t out_size)
 {
     snprintf(out, out_size, "%s/%s", BOOKS_BASE, id);
+}
+
+// One open decoder at a time. The reader is single-threaded (all access from
+// the LVGL/input task), so a single cache avoids repeated fopen per page.
+static reader_zdx_t s_zdx;
+static char s_zdx_id[READER_BOOK_ID_MAX];
+static bool s_zdx_open;
+// Upload verification inflates every chunk on the 6 KiB HTTP task, so its
+// ~18 KiB decoder must live in static storage, never on that task's stack.
+static reader_zdx_t s_verify_zdx;
+
+static void zdx_cache_close(void)
+{
+    if (s_zdx_open) {
+        FILE *fp = s_zdx.fp;  // reader_zdx_close() clears z->fp
+        reader_zdx_close(&s_zdx);
+        if (fp) fclose(fp);
+    }
+    s_zdx_open = false;
+    s_zdx_id[0] = '\0';
+}
+
+// Open the zdx decoder for a book (built-in or uploaded), reusing the cache
+// when it is already the current book. Built-ins decode from a flash-backed
+// memory image; uploads from a file. Returns a reader or NULL.
+static reader_zdx_t *zdx_for(const char *id)
+{
+    if (!id) return NULL;
+    if (s_zdx_open && strcmp(s_zdx_id, id) == 0) return &s_zdx;
+    zdx_cache_close();
+
+    int rc;
+    if (strncmp(id, "builtin:", 8) == 0) {
+        const reader_builtin_book_t *book = NULL;
+        for (int i = 0; i < g_builtin_book_count; ++i) {
+            if (strcmp(id, g_builtin_books[i].id) == 0) {
+                book = &g_builtin_books[i];
+                break;
+            }
+        }
+        if (!book) return NULL;
+        rc = reader_builtin_open(book, &s_zdx);
+    } else {
+        char path[READER_BOOK_ID_MAX + 16];
+        book_path(id, path, sizeof(path));
+        FILE *fp = fopen(path, "rb");
+        if (!fp) return NULL;
+        rc = reader_zdx_open(&s_zdx, fp);
+        if (rc != 0) fclose(fp);
+    }
+    if (rc != 0) {
+        memset(&s_zdx, 0, sizeof(s_zdx));
+        return NULL;
+    }
+    strncpy(s_zdx_id, id, sizeof(s_zdx_id) - 1);
+    s_zdx_id[sizeof(s_zdx_id) - 1] = '\0';
+    s_zdx_open = true;
+    return &s_zdx;
 }
 
 static void tmp_path(char *out, size_t out_size)
@@ -62,7 +123,7 @@ static void tmp_path(char *out, size_t out_size)
 // no control characters. UTF-8 bytes (Chinese names) are preserved.
 static void sanitize_name(const char *in, char *out, size_t out_size)
 {
-    const size_t limit = 32;  // leaves room for the ".txt" suffix
+    const size_t limit = 32;  // leaves room for the ".zdx" suffix
     size_t o = 0;
     for (const unsigned char *p = (const unsigned char *)in; *p && o < limit; ++p) {
         unsigned char c = *p;
@@ -75,10 +136,17 @@ static void sanitize_name(const char *in, char *out, size_t out_size)
     out[o] = '\0';
     if (o == 0) snprintf(out, out_size, "book");
 
+    // The web page always uploads a .zdx image. Strip any .txt/.zdx the user
+    // had in the picked filename and normalise to our single stored format.
     size_t len = strlen(out);
-    if (len < 4 || strcmp(out + len - 4, ".txt") != 0) {
-        if (len + 4 < out_size) strcat(out, ".txt");
+    if (len >= 4) {
+        if (strcmp(out + len - 4, ".txt") == 0 ||
+            strcmp(out + len - 4, ".zdx") == 0) {
+            out[len - 4] = '\0';
+            len -= 4;
+        }
     }
+    if (len + 4 < out_size) strcat(out, BOOK_EXT);
 }
 
 static void load_progress(void)
@@ -159,10 +227,14 @@ int reader_store_list(reader_book_info_t *out, int max)
         // Deleted samples stay in Flash but disappear from the shelf. The
         // protected guide (index 0) is never filtered out.
         if (i > 0 && i < 8 && (s_hidden_builtins & (1u << i))) continue;
+        const reader_builtin_book_t *book = &g_builtin_books[i];
         reader_book_info_t *b = &out[count++];
-        snprintf(b->id, sizeof(b->id), "%s", g_builtin_books[i].id);
-        snprintf(b->title, sizeof(b->title), "%s", g_builtin_books[i].title);
-        b->size = (uint32_t)strlen(g_builtin_books[i].text);
+        snprintf(b->id, sizeof(b->id), "%s", book->id);
+        snprintf(b->title, sizeof(b->title), "%s", book->title);
+        // Shelf shows the compressed footprint; progress/subtitle use the
+        // uncompressed length (both from the generated zdx metadata).
+        b->size = (uint32_t)book->zdx_len;
+        b->orig_size = book->orig_size;
         b->builtin = true;
     }
 
@@ -174,7 +246,7 @@ int reader_store_list(reader_book_info_t *out, int max)
         const char *name = ent->d_name;
         if (name[0] == '.') continue;  // skip .upload.tmp and hidden files
         size_t nlen = strlen(name);
-        if (nlen < 4 || strcmp(name + nlen - 4, ".txt") != 0) continue;
+        if (nlen < 4 || strcmp(name + nlen - 4, BOOK_EXT) != 0) continue;
 
         char path[READER_BOOK_ID_MAX + 16];
         book_path(name, path, sizeof(path));
@@ -185,13 +257,24 @@ int reader_store_list(reader_book_info_t *out, int max)
         // reading, so skip it instead of silently truncating the id.
         if (nlen >= sizeof(out[count].id)) continue;
 
+        FILE *fp = fopen(path, "rb");
+        if (!fp) continue;
+        // Header-only probe: no ~18 KiB decoder on this task's small stack.
+        uint32_t orig_size = 0, text_chars = 0;
+        if (reader_zdx_probe(fp, &orig_size, &text_chars) != 0) {
+            // Unreadable/legacy file: skip rather than offer a broken shelf row.
+            fclose(fp);
+            continue;
+        }
         reader_book_info_t *b = &out[count++];
         snprintf(b->id, sizeof(b->id), "%.*s",
                  (int)(sizeof(b->id) - 1), name);
         snprintf(b->title, sizeof(b->title), "%.*s",
-                 (int)(nlen - 4), name);  // display without .txt
+                 (int)(nlen - 4), name);  // display without .zdx
         b->size = (uint32_t)st.st_size;
+        b->orig_size = orig_size;
         b->builtin = false;
+        fclose(fp);
     }
     closedir(dir);
     return count;
@@ -201,31 +284,11 @@ int reader_store_read(const char *id, size_t offset, char *buf, size_t len)
 {
     if (!id || !buf || len == 0) return 0;
 
-    if (strncmp(id, "builtin:", 8) == 0) {
-        for (int i = 0; i < g_builtin_book_count; ++i) {
-            if (strcmp(id, g_builtin_books[i].id) != 0) continue;
-            const char *text = g_builtin_books[i].text;
-            size_t total = strlen(text);
-            if (offset >= total) return 0;
-            size_t n = total - offset;
-            if (n > len) n = len;
-            memcpy(buf, text + offset, n);
-            return (int)n;
-        }
-        return 0;
-    }
-
-    char path[READER_BOOK_ID_MAX + 16];
-    book_path(id, path, sizeof(path));
-    FILE *fp = fopen(path, "rb");
-    if (!fp) return 0;
-    if (fseek(fp, (long)offset, SEEK_SET) != 0) {
-        fclose(fp);
-        return 0;
-    }
-    size_t n = fread(buf, 1, len, fp);
-    fclose(fp);
-    return (int)n;
+    // Built-in books are zdx images in flash; uploads are zdx files. Both go
+    // through the same decoder so logical byte offsets stay identical.
+    reader_zdx_t *z = zdx_for(id);
+    if (!z) return 0;
+    return (int)reader_zdx_read(z, offset, buf, len);
 }
 
 // Truncate a line to a title without splitting a UTF-8 character.
@@ -346,23 +409,32 @@ esp_err_t reader_store_write_chunk(const char *data, size_t len)
     return err;
 }
 
-// Count unsupported code points by streaming the temporary file. This runs in
-// the HTTP worker task, so it uses the plain C code-point table, never LVGL.
-static uint32_t count_unsupported(const char *path)
+// Verify a freshly uploaded zdx and count unsupported code points by streaming
+// its ORIGINAL text through the same decoder the reader uses. Runs on the HTTP
+// worker task with a stack-local decoder (~18 KiB), so never call this from the
+// small input task. Returns 0 on success, -1 when the image is invalid.
+static int verify_and_count(const char *path, uint32_t *unsupported_out)
 {
     FILE *fp = fopen(path, "rb");
-    if (!fp) return 0;
+    if (!fp) return -1;
+    reader_zdx_t *z = &s_verify_zdx;
+    if (reader_zdx_open(z, fp) != 0 || reader_zdx_verify(z) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
     char buf[512 + 4];
     size_t carry = 0;
     uint32_t total = 0;
-
-    for (;;) {
-        size_t n = fread(buf + carry, 1, 512, fp);
+    size_t offset = 0;
+    while (offset < z->original_size) {
+        size_t n = reader_zdx_read(z, offset, buf + carry, 512);
+        if (n == 0) { fclose(fp); return -1; }
         size_t len = carry + n;
-        if (len == 0) break;
+        offset += n;
 
-        // Do not scan an incomplete UTF-8 sequence at the chunk boundary;
-        // carry those bytes into the next chunk instead of miscounting them.
+        // Do not scan an incomplete UTF-8 sequence at the window boundary;
+        // carry those bytes into the next window instead of miscounting them.
         size_t usable = len;
         size_t lead = len;
         while (lead > 0 && ((unsigned char)buf[lead - 1] & 0xC0) == 0x80) --lead;
@@ -386,10 +458,12 @@ static uint32_t count_unsupported(const char *path)
         carry = len - usable;
         if (carry > 0 && carry <= 4) memmove(buf, buf + usable, carry);
         else carry = 0;
-        if (n < 512) break;
     }
+    // Any leftover carried bytes are an incomplete UTF-8 tail; ignore them.
+    reader_zdx_close(z);
     fclose(fp);
-    return total;
+    if (unsupported_out) *unsupported_out = total;
+    return 0;
 }
 
 esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
@@ -408,8 +482,15 @@ esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
     tmp_path(tmp, sizeof(tmp));
     book_path(id, dst, sizeof(dst));
 
-    uint32_t unsupported = count_unsupported(tmp);
+    uint32_t unsupported = 0;
+    if (verify_and_count(tmp, &unsupported) != 0) {
+        ESP_LOGW(TAG, "上传文件不是有效的 zdx 或已损坏: %s", tmp);
+        remove(tmp);
+        xSemaphoreGive(s_upload_lock);
+        return ESP_ERR_INVALID_ARG;
+    }
     // Replace any existing book with the same name atomically enough for SPIFFS.
+    zdx_cache_close();  // invalidate any decoder pointing at the old file
     remove(dst);
     esp_err_t err = (rename(tmp, dst) == 0) ? ESP_OK : ESP_FAIL;
     if (err != ESP_OK) {
@@ -431,6 +512,7 @@ void reader_store_abort_upload(void)
         fclose(s_upload_fp);
         s_upload_fp = NULL;
     }
+    zdx_cache_close();
     char tmp[READER_BOOK_ID_MAX + 16];
     tmp_path(tmp, sizeof(tmp));
     remove(tmp);
@@ -441,6 +523,7 @@ esp_err_t reader_store_delete(const char *id)
 {
     if (!id || id[0] == '\0' || !s_spiffs_mounted) return ESP_ERR_INVALID_ARG;
     if (strncmp(id, "builtin:", 8) == 0) return ESP_ERR_NOT_SUPPORTED;
+    if (s_zdx_open && strcmp(s_zdx_id, id) == 0) zdx_cache_close();
     char path[READER_BOOK_ID_MAX + 16];
     book_path(id, path, sizeof(path));
     return remove(path) == 0 ? ESP_OK : ESP_ERR_NOT_FOUND;

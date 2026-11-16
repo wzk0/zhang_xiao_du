@@ -23,7 +23,8 @@
 typedef struct {
     char id[READER_BOOK_ID_MAX];
     char title[READER_BOOK_TITLE_MAX];
-    uint32_t size;
+    uint32_t size;       // bytes stored in flash (compressed zdx footprint)
+    uint32_t orig_size;  // original UTF-8 byte length (offset/progress space)
     bool builtin;
 } reader_book_info_t;
 

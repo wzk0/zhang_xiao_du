@@ -8,13 +8,15 @@ idf_component_register(
          "reader_progress.c"
          "reader_bookmark.c"
          "reader_store.c"
+         "reader_zdx.c"
          "reader_transfer.c"
          "reader_fonts.c"
          "builtin_books.c"
+         "builtin_books_data.c"
     INCLUDE_DIRS "."
     EMBED_TXTFILES "${CMAKE_CURRENT_LIST_DIR}/../assets/web/transfer.html"
     REQUIRES bsp nvs_flash esp_wifi esp_netif esp_event esp_http_server
-             spiffs esp_timer lwip
+             spiffs esp_timer lwip uzlib
 )
 
 # Generated Chinese bitmap fonts live in assets/ and are compiled into flash.

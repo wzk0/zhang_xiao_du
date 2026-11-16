@@ -3,8 +3,7 @@
 // Boots straight into the redesigned shelf UI; there is no baseline test menu.
 // Audio is deliberately NOT initialized: this application never plays sound,
 // and leaving the codec/I2S resources unused keeps the largest free heap block
-// available for Wi-Fi + HTTP when the transfer page opens (see the SoftAP
-// resource-budget note in docs/reference/phoenixzhc/).
+// available for Wi-Fi + HTTP when the transfer page opens.
 #include "bsp_battery.h"
 #include "bsp_button.h"
 #include "bsp_display.h"

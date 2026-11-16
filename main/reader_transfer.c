@@ -293,7 +293,7 @@ static esp_err_t handle_delete(httpd_req_t *req)
 static esp_err_t handle_upload(httpd_req_t *req)
 {
     if (req->content_len == 0 || req->content_len > READER_MAX_UPLOAD_BYTES) {
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"文件大小必须在 1 B 到 512 KB 之间\"}");
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"zdx 文件大小必须在 1 B 到 512 KB 之间\"}");
     }
     size_t total = 0, used = 0, free_b = 0;
     if (reader_store_space(&total, &used, &free_b) == ESP_OK &&

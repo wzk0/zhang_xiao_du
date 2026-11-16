@@ -98,18 +98,25 @@ run_static_checks() {
         tests/test_reader_storage.c main/reader_storage.c \
         -o "${test_dir}/test_reader_storage"
     "${test_dir}/test_reader_storage"
+    # zdx decoder: the exact C the firmware uses, decoded against fixtures
+    # produced by tools/zdx_codec.py (same raw-deflate settings as pako).
+    PYTHONDONTWRITEBYTECODE=1 python3 tests/test_reader_zdx.py
     # Whole state machine under in-memory stubs: navigation, finished-book
     # back-step (the stack-overflow reboot regression), bookmark labels and
     # the long-press delete / storage flows.
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror \
-        -Itests/reader_app_stubs -Imain \
+        -Itests/reader_app_stubs -Imain -Icomponents/uzlib \
         tests/test_reader_app_navigation.c \
         main/reader_text.c main/reader_layout.c main/reader_storage.c \
-        main/reader_progress.c main/reader_bookmark.c main/builtin_books.c \
+        main/reader_progress.c main/reader_bookmark.c \
+        main/builtin_books.c main/builtin_books_data.c main/reader_zdx.c \
+        components/uzlib/tinflate.c components/uzlib/crc32.c \
+        components/uzlib/adler32.c \
         -o "${test_dir}/test_reader_app_navigation"
     "${test_dir}/test_reader_app_navigation"
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_reader_font_coverage.py
     PYTHONDONTWRITEBYTECODE=1 python3 tools/gen_reader_font.py --check
+    PYTHONDONTWRITEBYTECODE=1 python3 tools/gen_builtin_books.py --check
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_battery_profile.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_deep_sleep_contract.py
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_key_wake_contract.py

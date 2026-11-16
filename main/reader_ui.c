@@ -509,7 +509,7 @@ void reader_ui_render_finished(const char *book_title)
 // Title card — page 0 of every book, reachable by pressing UP on page 1
 // ---------------------------------------------------------------------------
 void reader_ui_render_cover(const char *book_title, size_t char_count,
-                            size_t book_bytes)
+                            size_t flash_bytes)
 {
     lv_obj_t *scr = new_screen(READER_SCREEN_COVER);
     // Same quiet grammar as the 完 page: one large centred word, a small
@@ -527,7 +527,7 @@ void reader_ui_render_cover(const char *book_title, size_t char_count,
     // before the index scan has finished; show the size alone in that frame
     // rather than a misleading "0字".
     char sz[24], sub_text[48];
-    format_size(book_bytes, sz, sizeof(sz));
+    format_size(flash_bytes, sz, sizeof(sz));
     if (char_count) {
         snprintf(sub_text, sizeof(sub_text), "%u字 · %s",
                  (unsigned)char_count, sz);

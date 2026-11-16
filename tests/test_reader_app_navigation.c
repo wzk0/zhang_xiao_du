@@ -9,11 +9,14 @@
 //
 // Build from the repository root (tests/test_reader_app_navigation.c is the
 // only translation unit; it pulls in the real state machine via #include):
-//   cc -std=c11 -Wall -Wextra -Werror -Itests/reader_app_stubs -Imain
+//   cc -std=c11 -Wall -Wextra -Werror -Itests/reader_app_stubs -Imain -Icomponents/uzlib
 //      tests/test_reader_app_navigation.c main/reader_text.c
 //      main/reader_layout.c main/reader_storage.c main/reader_progress.c
-//      main/reader_bookmark.c main/builtin_books.c -o /tmp/test_reader_app_navigation
+//      main/reader_bookmark.c main/builtin_books.c main/builtin_books_data.c
+//      main/reader_zdx.c components/uzlib/tinflate.c components/uzlib/crc32.c
+//      components/uzlib/adler32.c -o /tmp/test_reader_app_navigation
 #include "builtin_books.h"
+#include "builtin_books_data.h"
 #include "reader_app.h"
 #include "reader_bookmark.h"
 #include "reader_layout.h"
@@ -23,6 +26,7 @@
 #include "reader_text.h"
 #include "reader_transfer.h"
 #include "reader_ui.h"
+#include "reader_zdx.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -117,11 +121,11 @@ void reader_ui_render_finished(const char *book_title)
              book_title ? book_title : "");
 }
 void reader_ui_render_cover(const char *book_title, size_t char_count,
-                            size_t book_bytes)
+                            size_t flash_bytes)
 {
     g_rendered = READER_SCREEN_COVER;
     g_cover_chars = char_count;
-    g_cover_bytes = book_bytes;
+    g_cover_bytes = flash_bytes;
     snprintf(g_cover_title, sizeof(g_cover_title), "%s",
              book_title ? book_title : "");
 }
@@ -186,13 +190,22 @@ static reader_progress_blob_t g_progress;
 static reader_bookmark_blob_t g_bookmarks;
 static uint8_t g_settings[16];
 
-static const char *text_for(const char *id)
+// Built-in books are zdx images (as on device). Decode through the real
+// reader_zdx memory path so the test exercises the same offset semantics.
+static const reader_builtin_book_t *builtin_for(const char *id)
 {
     if (!id) return NULL;
     for (int i = 0; i < g_builtin_book_count; ++i) {
-        if (strcmp(id, g_builtin_books[i].id) == 0) return g_builtin_books[i].text;
+        if (strcmp(id, g_builtin_books[i].id) == 0) return &g_builtin_books[i];
     }
-    if (strcmp(id, UPLOAD_ID) == 0) return UPLOAD_TEXT;
+    return NULL;
+}
+
+static const char *text_for(const char *id)
+{
+    // Only the uploaded test novel is exposed as a plain C string; built-ins
+    // go through the zdx decoder in reader_store_read() below.
+    if (id && strcmp(id, UPLOAD_ID) == 0) return UPLOAD_TEXT;
     return NULL;
 }
 
@@ -212,7 +225,8 @@ int reader_store_list(reader_book_info_t *out, int max)
         if (i > 0 && i < 8 && (g_hidden_builtins & (1u << i))) continue;
         snprintf(out[n].id, sizeof(out[n].id), "%s", g_builtin_books[i].id);
         snprintf(out[n].title, sizeof(out[n].title), "%s", g_builtin_books[i].title);
-        out[n].size = (uint32_t)strlen(g_builtin_books[i].text);
+        out[n].size = (uint32_t)g_builtin_books[i].zdx_len;
+        out[n].orig_size = g_builtin_books[i].orig_size;
         out[n].builtin = true;
         ++n;
     }
@@ -220,6 +234,7 @@ int reader_store_list(reader_book_info_t *out, int max)
         snprintf(out[n].id, sizeof(out[n].id), "%s", UPLOAD_ID);
         snprintf(out[n].title, sizeof(out[n].title), "%s", "测试小说");
         out[n].size = (uint32_t)strlen(UPLOAD_TEXT);
+        out[n].orig_size = out[n].size;
         out[n].builtin = false;
         ++n;
     }
@@ -236,6 +251,16 @@ esp_err_t reader_store_space(size_t *total, size_t *used, size_t *free_bytes)
 
 int reader_store_read(const char *id, size_t offset, char *buf, size_t len)
 {
+    const reader_builtin_book_t *book = builtin_for(id);
+    if (book) {
+        static reader_zdx_t z;
+        static char opened_id[64];
+        if (!opened_id[0] || strcmp(opened_id, id) != 0) {
+            if (reader_builtin_open(book, &z) != 0) return 0;
+            snprintf(opened_id, sizeof(opened_id), "%s", id);
+        }
+        return (int)reader_zdx_read(&z, offset, buf, len);
+    }
     const char *text = text_for(id);
     if (!text || offset >= strlen(text)) return 0;
     size_t total = strlen(text);
@@ -500,8 +525,10 @@ static void test_first_open_cover(void)
     CHECK(g_rendered == READER_SCREEN_COVER);
     CHECK(g_cover_title[0] != '\0');
     CHECK(strcmp(g_cover_title, s_state.current_title) == 0);
-    // The subtitle is book data: readable size plus a real word count.
-    CHECK(g_cover_bytes == s_state.book_size);
+    // The subtitle is book data: compressed flash footprint plus a real word
+    // count — NOT the uncompressed length used for progress/offset arithmetic.
+    CHECK(g_cover_bytes == s_state.book_flash_size);
+    CHECK(g_cover_bytes < s_state.book_size);
     CHECK(g_cover_chars == s_state.book_chars);
     CHECK(g_cover_chars > 0);
 
@@ -550,7 +577,8 @@ static void test_cover_is_page_zero(void)
     CHECK(s_state.screen == READER_SCREEN_COVER);
     CHECK(g_rendered == READER_SCREEN_COVER);
     CHECK(strcmp(g_cover_title, s_state.current_title) == 0);
-    CHECK(g_cover_bytes == s_state.book_size);
+    CHECK(g_cover_bytes == s_state.book_flash_size);
+    CHECK(g_cover_bytes < s_state.book_size);
     CHECK(g_cover_chars > 0);
 
     tap(BSP_BTN_DOWN);
@@ -904,7 +932,7 @@ static void test_all_builtin_books_readable(void)
     CHECK(g_builtin_book_count == 2);
     for (int i = 0; i < g_builtin_book_count; ++i) {
         const char *id = g_builtin_books[i].id;
-        size_t bytes = strlen(g_builtin_books[i].text);
+        size_t bytes = g_builtin_books[i].orig_size;
         CHECK(bytes > 200);
 
         reader_book_index_t idx;

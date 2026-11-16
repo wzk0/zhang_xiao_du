@@ -2,8 +2,7 @@
 //
 // Keeping these independent of ESP-IDF/LVGL lets host tests assert that every
 // selectable font size still fits the fixed body box. A CJK font's line_height
-// is NOT its pixel size: every generated font reports size + 4 (see
-// docs/reference/shinku-chen/cjk-line-pitch-from-font-metrics.md), so the line
+// is NOT its pixel size: every generated font reports size + 4, so the line
 // pitch fed to the paginator is always line_height, never the pixel size.
 #pragma once
 
