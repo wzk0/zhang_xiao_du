@@ -19,8 +19,8 @@ description: 根据日志和重启、栈异常、看门狗、文字空白、黑�
 - 区分观察事实、可能原因与待验证推测。栈指针超出日志给出的任务栈边界，
   是栈异常的直接证据；准确的分配／调用函数仍需要匹配符号。
 - 分析当前应用代码时阅读相关头文件和实现。针对现象查询
-  `docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.zh_CN.md`，不套用
-  通用 ESP32 开发板的引脚或假设。
+  `components/bsp/include/bsp_pins.h` 与对应的 BSP 头文件，不套用通用 ESP32
+  开发板的引脚或假设。
 
 ## 先匹配符号，再解码地址
 
@@ -40,7 +40,8 @@ description: 根据日志和重启、栈异常、看门狗、文字空白、黑�
 
 按相关路径检查：任务栈／局部缓冲及调用深度、分配失败与最大可用连续堆块、
 UI 线程／字体／样式、外设初始化，或页面退出后仍存活的任务／回调。中文
-问题阅读 `docs/development/engineering/lvgl-chinese-fonts.zh_CN.md`。不通过
+问题核对 `assets/fonts/charset.txt`、`assets/fonts/reader_charset.h` 与
+`AGENTS.md` 的字体规则。不通过
 隐藏占位符掩盖缺字，不关闭看门狗／栈保护，也不在未评估无 PSRAM 内存预算
 时盲目增加所有缓冲／任务栈。
 

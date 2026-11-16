@@ -7,10 +7,8 @@ description: 验证并打包 FoloToy AI Passport 固件，交付已校验的合�
 
 # 构建与打包固件
 
-确定目标工作区，执行 `git status --short --branch`，阅读其中的 `AGENTS.md`、
-`docs/development/engineering/build-and-test.zh_CN.md` 和
-`docs/development/engineering/firmware-layout.zh_CN.md`。下列命令均在该工作区
-根目录运行，不猜测开发者私有 IDF 路径。
+确定目标工作区，执行 `git status --short --branch`，阅读其中的 `AGENTS.md`。下列命令均在该工作区根目录运行，不猜测开发者私有
+IDF 路径。
 
 ## 构建用户要求的配置
 

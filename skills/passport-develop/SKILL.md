@@ -11,8 +11,7 @@ Use this workflow for an implementation request, not as permission to start a
 different project. The user's explicit choices take precedence over this
 skill's defaults. Resolve the target checkout with `git rev-parse --show-toplevel`;
 all paths below are relative to that checkout, not the installed skill folder.
-Read `AGENTS.md` and `docs/development/ai-guide.md`, then only the task's routed
-documents. Start with `git status --short --branch`.
+Read `AGENTS.md`, then only the task's routed files. Start with `git status --short --branch`.
 
 ## Turn the request into a working increment
 
@@ -26,7 +25,7 @@ documents. Start with `git status --short --branch`.
    switch, stash, reset, or overwrite someone else's changes to obtain a clean
    starting point. If work overlaps or branch choice is ambiguous, resolve it
    with the user. Do not commit, push, or publish without authorization.
-3. Consult relevant demo branches and `docs/reference/README.md`. Extract the
+3. Consult the relevant demo branches. Extract the
    needed patterns, not whole branches or their stale BSP/configuration. Apply
    the AI guide's mandatory UI redesign rule: derivative applications must have
    their own screens and interactions, never the current demo test menu, screens,
@@ -49,10 +48,10 @@ to invoke a skill unavailable to the current agent.
 
 | Situation | Skill | Repository fallback |
 | --- | --- | --- |
-| Missing or broken toolchain | `passport-setup` | `docs/development/engineering/environment-setup.md` |
-| Validate and package firmware | `passport-build` | `docs/development/engineering/build-and-test.md` |
-| User accepts on-device testing | `passport-device-test` | `docs/development/ai-guide.md`, on-device handoff |
-| Runtime failure or crash | `passport-debug` | `docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.md`, troubleshooting |
+| Missing or broken toolchain | `passport-setup` | `tools/validate.sh`, `sdkconfig.defaults` |
+| Validate and package firmware | `passport-build` | `tools/validate.sh`, `tools/verify_firmware.py` |
+| User accepts on-device testing | `passport-device-test` | `AGENTS.md`, device-testing section |
+| Runtime failure or crash | `passport-debug` | `AGENTS.md`, matching BSP header |
 
 ## Handoff and continuation
 
@@ -61,12 +60,12 @@ step. Describe the redesigned pages and controls, and check that startup and
 navigation no longer lead to the baseline test UI before calling the application
 complete. For a multi-stage task, keep a concise checkpoint in the application's
 existing project notes: accepted requirements, completed/pending work, exact
-build identity, and device results. If new maintained Markdown is warranted,
-use paired documents under `docs/`; never store secrets or raw private logs.
-Do not create a progress-document framework for a small edit.
+build identity, and device results. Do not add new Markdown documents: `AGENTS.md` and `README.md` are the whole
+documentation set. Never store secrets or raw private logs, and do not create a
+progress-document framework for a small edit.
 
-After a completed firmware implementation, proactively offer device testing
-using `docs/development/ai-guide.md`. A build or connected USB device does not
+After a completed firmware implementation, proactively offer device testing as
+`AGENTS.md` requires. A build or connected USB device does not
 authorize flashing. Stop for the user's decision if the remaining work requires
 new authority; do not turn that pause into an automatic release.
 

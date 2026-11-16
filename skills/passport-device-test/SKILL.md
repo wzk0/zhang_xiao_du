@@ -7,10 +7,9 @@ description: Guide authorized flashing and on-device acceptance of FoloToy AI Pa
 
 # Flash and Test on the Device
 
-Locate the user's checkout; read `AGENTS.md`, the on-device handoff in
-`docs/development/ai-guide.md`, and the flashing/data policy in
-`docs/development/engineering/firmware-layout.md`. Use the applicable hardware
-acceptance checklist, not every peripheral test for every change.
+Locate the user's checkout and read `AGENTS.md`, which carries the device-test
+handoff and the flashing/data policy. Use the applicable hardware acceptance
+checklist, not every peripheral test for every change.
 
 ## Establish access, artifact, and consent
 

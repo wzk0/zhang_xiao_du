@@ -1,4 +1,7 @@
 build/
+.ccache/
+__pycache__/
+*.pyc
 sdkconfig
 sdkconfig.old
 managed_components/

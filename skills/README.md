@@ -20,9 +20,6 @@ Each skill must contain at least `SKILL.md` with YAML frontmatter defining `name
 | [passport-build](passport-build/SKILL.md) | Run the shared gate and retain a verified merged image with matching ELF/MAP artifacts. |
 | [passport-device-test](passport-device-test/SKILL.md) | After authorization, identify the target, flash the chosen firmware, and distinguish logs from physical acceptance. |
 | [passport-debug](passport-debug/SKILL.md) | Diagnose crashes, memory problems, blank Chinese text, and peripheral failures using evidence and matching symbols. |
-| [issue-suggestions](issue-suggestions/SKILL.md) | After a release, collect the releasing developer's own improvement points and file them as feature request issues against the upstream project. |
-| [experience-pr](experience-pr/SKILL.md) | After a release, collect reusable development experience and submit it as a documentation pull request. |
-| [plays-archive](plays-archive/SKILL.md) | After a release, archive the published application under the repository-relative `docs/reference/<username>/<app-name>/` with an AI-generated bilingual summary; record cover metadata only, without committing the image. |
 
 ## Required preparation, handled by the AI
 

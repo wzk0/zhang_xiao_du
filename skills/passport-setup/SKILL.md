@@ -7,8 +7,7 @@ description: Prepare or diagnose the local ESP-IDF environment for FoloToy AI Pa
 
 # Prepare the Development Environment
 
-Resolve the target checkout and read its `AGENTS.md` and
-`docs/development/engineering/environment-setup.md`. Paths refer to that
+Resolve the target checkout and read its `AGENTS.md`. Paths refer to that
 checkout. Preserve the user's chosen OS, installation paths, proxies, and
 existing tools; do not replace another ESP-IDF installation.
 

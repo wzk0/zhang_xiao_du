@@ -7,9 +7,7 @@ description: 初次使用 FoloToy AI Passport、工具缺失或工具链激活�
 
 # 准备开发环境
 
-确定目标工作区，阅读其 `AGENTS.md` 和
-`docs/development/engineering/environment-setup.zh_CN.md`。文中路径均相对
-该工作区。保留用户选择的系统、安装路径、代理和已有工具，不替换其他版本
+确定目标工作区，阅读其 `AGENTS.md`。文中路径均相对该工作区。保留用户选择的系统、安装路径、代理和已有工具，不替换其他版本
 的 ESP-IDF 安装。
 
 ## 先检查，再修改

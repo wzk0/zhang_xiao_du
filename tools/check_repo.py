@@ -15,11 +15,6 @@ FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 MARKDOWN_LINK_RE = re.compile(r"!?\[[^\]]*\]\(([^)]+)\)")
 HTML_LINK_RE = re.compile(r"\bhref\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
 MARKDOWN_REFERENCE_RE = re.compile(r"(?m)^ {0,3}\[[^\]]+\]:\s*(<[^>\n]+>|\S+)")
-COMMUNITY_DOCUMENT_NAMES = {
-    f"{stem}{suffix}.md"
-    for stem in ("CONTRIBUTING", "CODE_OF_CONDUCT", "SECURITY", "SUPPORT")
-    for suffix in ("", ".zh_CN")
-}
 CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
 SECRET_PATTERNS = {
     "GitHub token": re.compile(r"(?:ghp_|github_pat_)[A-Za-z0-9_]{20,}"),
@@ -105,11 +100,6 @@ def check_required_files(errors: list[str]) -> None:
     required = (
         "AGENTS.md",
         "AGENTS.zh_CN.md",
-        "docs/CHANGELOG.md",
-        ".github/CONTRIBUTING.md",
-        ".github/CODE_OF_CONDUCT.md",
-        ".github/SECURITY.md",
-        ".github/SUPPORT.md",
         "dependencies.lock",
         "sdkconfig.defaults",
         "partitions.csv",
@@ -128,7 +118,7 @@ def check_required_files(errors: list[str]) -> None:
     for path in sorted(ROOT.glob("*.md")):
         if path.name not in ROOT_MARKDOWN_ALLOWLIST and not ROOT_README_RE.fullmatch(path.name):
             errors.append(
-                f"{path.name}: root Markdown must move to docs/ or .github/"
+                f"{path.name}: root Markdown must move into .github/"
             )
 
 
@@ -159,57 +149,6 @@ def check_markdown_links(
             if target is not None and not target.resolve().exists():
                 display = raw_target.strip().split(maxsplit=1)[0].strip("<>")
                 errors.append(f"{path.relative_to(ROOT).as_posix()}: missing link target {display}")
-
-
-def check_community_document_links(files: list[Path], errors: list[str]) -> None:
-    """Keep overview/file-view navigation independent of the render directory."""
-    def target_path(raw: str) -> str:
-        # Ignore optional link titles, just as the existing local-link check does.
-        fields = raw.strip().split(maxsplit=1)
-        return fields[0].strip("<>") if fields else ""
-
-    for path in files:
-        if path.parent != ROOT / ".github" or path.name not in COMMUNITY_DOCUMENT_NAMES:
-            continue
-        text = path.read_text(encoding="utf-8")
-        peer = (
-            path.name.removesuffix(".zh_CN.md") + ".md"
-            if path.name.endswith(".zh_CN.md")
-            else path.stem + ".zh_CN.md"
-        )
-        expected = f"/.github/{peer}"
-        # Keep the switch on the first nonempty line, outside raw HTML blocks
-        # (Markdown inside <p> is not rendered as a link by GitHub).
-        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        opening_targets = [target_path(raw) for raw in MARKDOWN_LINK_RE.findall(first_line)]
-        if expected not in opening_targets or re.search(r"<!--|</?[A-Za-z][^>]*>", first_line):
-            errors.append(
-                f"{path.relative_to(ROOT).as_posix()}: language switch must use a Markdown link to {expected} on the first nonempty line, outside HTML"
-            )
-
-        # Also reject relative HTML anchors so the original homepage bug cannot
-        # hide behind an otherwise valid Markdown language switch.
-        targets = (
-            MARKDOWN_LINK_RE.findall(text)
-            + MARKDOWN_REFERENCE_RE.findall(text)
-            + HTML_LINK_RE.findall(text)
-        )
-        for raw_target in targets:
-            target = target_path(raw_target)
-            parsed = urlsplit(target)
-            if parsed.hostname == "github.com" and parsed.path.lower().startswith(
-                ("/folotoy/ai-passport/blob/", "/folotoy/ai-passport/tree/")
-            ):
-                errors.append(
-                    f"{path.relative_to(ROOT).as_posix()}: community document link must not hardcode the upstream repository/ref: {target}"
-                )
-                continue
-            if target.startswith(("#", "http://", "https://", "mailto:")):
-                continue
-            if not target.startswith("/") or target.startswith("//"):
-                errors.append(
-                    f"{path.relative_to(ROOT).as_posix()}: community document link must use a repository-root path: {target}"
-                )
 
 
 def check_document_languages(
@@ -354,19 +293,6 @@ def check_action_pins(errors: list[str]) -> None:
                 errors.append(f"{path.relative_to(ROOT).as_posix()}:{line_number}: action must use a full commit SHA: {action}")
 
 
-def check_issue_forms(errors: list[str]) -> None:
-    issue_dir = ROOT / ".github" / "ISSUE_TEMPLATE"
-    for name in ("feature_request.yml", "usage_question.yml"):
-        path = issue_dir / name
-        if not path.is_file():
-            errors.append(f"missing issue form: {path.relative_to(ROOT).as_posix()}")
-            continue
-        text = path.read_text(encoding="utf-8")
-        for field in ("name:", "description:", "body:"):
-            if not re.search(rf"(?m)^{re.escape(field)}", text):
-                errors.append(f"{path.relative_to(ROOT).as_posix()}: missing top-level {field[:-1]}")
-
-
 def check_sensitive_content(files: list[Path], errors: list[str]) -> None:
     for path in files:
         text = path.read_text(encoding="utf-8")
@@ -392,12 +318,10 @@ def main() -> int:
     files = text_files()
     check_required_files(errors)
     check_markdown_links(files, errors, vendored_roots)
-    check_community_document_links(files, errors)
     check_document_languages(files, errors, vendored_roots)
     check_root_language_links(files, errors)
     check_root_readme_links(files, errors)
     check_action_pins(errors)
-    check_issue_forms(errors)
     check_sensitive_content(files, errors)
     check_conflict_markers(files, errors)
 

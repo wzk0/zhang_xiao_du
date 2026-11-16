@@ -23,8 +23,8 @@ automatically its source.
   pointer outside the reported task bounds is direct evidence of a stack fault;
   the exact allocating/calling function still requires matching symbols.
 - For the current application's code, inspect the relevant headers and
-  implementation. Use `docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.md`
-  for the matching symptom, not a generic ESP32 board's pins or assumptions.
+  implementation. Use `components/bsp/include/bsp_pins.h` and the matching BSP header for the
+  symptom, not a generic ESP32 board's pins or assumptions.
 
 ## Match symbols before decoding addresses
 
@@ -47,7 +47,8 @@ rebuild the current source and call it the old firmware.
 Check the relevant path: task stack/local buffers and call depth; allocation
 failures and largest suitable heap block; UI threading/font/style selection;
 peripheral initialization; or tasks/callbacks surviving page exit. For Chinese
-text read `docs/development/engineering/lvgl-chinese-fonts.md`. Do not fix missing
+text check `assets/fonts/charset.txt`, `assets/fonts/reader_charset.h`, and the
+font rule in `AGENTS.md`. Do not fix missing
 glyphs by hiding placeholders, disable watchdog/stack protection, or increase
 every buffer/stack without examining the no-PSRAM memory budget.
 

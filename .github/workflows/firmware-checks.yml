@@ -3,16 +3,16 @@ name: Firmware checks
 on:
   pull_request:
     paths-ignore:
-      - "docs/**"
       - "skills/**"
-      - "*.md"
+      - ".github/**"
+      - "**.md"
   push:
     branches:
       - main
     paths-ignore:
-      - "docs/**"
       - "skills/**"
-      - "*.md"
+      - ".github/**"
+      - "**.md"
   workflow_dispatch:
 
 permissions:
@@ -26,6 +26,7 @@ jobs:
   firmware:
     name: ESP-IDF 5.5.3 firmware
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 

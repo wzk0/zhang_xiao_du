@@ -7,9 +7,7 @@ description: 为已授权的 FoloToy AI Passport 烧录与真机验收提供设�
 
 # 烧录与真机测试
 
-确定用户工作区，阅读 `AGENTS.md`、`docs/development/ai-guide.zh_CN.md`
-的真机交接流程，以及 `docs/development/engineering/firmware-layout.zh_CN.md`
-的烧录／数据策略。使用与修改相关的硬件验收清单，不要求每次测试全部外设。
+确定用户工作区，阅读 `AGENTS.md` 中的真机交接流程与烧录／数据策略。使用与修改相关的硬件验收清单，不要求每次测试全部外设。
 
 ## 确认访问、产物与授权
 

@@ -8,9 +8,8 @@ description: Validate and package FoloToy AI Passport firmware, including a veri
 # Build and Package Firmware
 
 Resolve the target checkout, run `git status --short --branch`, and read
-`AGENTS.md`, `docs/development/engineering/build-and-test.md`, and
-`docs/development/engineering/firmware-layout.md` there. All commands below run
-from that checkout; never infer a developer-specific IDF path.
+`AGENTS.md` there. All commands below run from that checkout; never infer a
+developer-specific IDF path.
 
 ## Build the requested configuration
 

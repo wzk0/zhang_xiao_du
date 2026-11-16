@@ -9,8 +9,7 @@ description: 根据用户需求实现或扩展 FoloToy AI Passport 应用，组�
 
 本流程用于实现请求，不代表获得另起项目的授权。用户明确选择优先于本技能
 的默认做法。用 `git rev-parse --show-toplevel` 确定目标工作区；下列路径均
-相对于该工作区，而不是安装后的技能目录。先读 `AGENTS.md` 和
-`docs/development/ai-guide.zh_CN.md`，再按任务路由阅读所需文档。
+相对于该工作区，而不是安装后的技能目录。先读 `AGENTS.md`，再按任务路由阅读所需文件。
 首先执行 `git status --short --branch`。
 
 ## 把需求变成可工作的增量
@@ -21,7 +20,7 @@ description: 根据用户需求实现或扩展 FoloToy AI Passport 应用，组�
 2. 已有应用沿用其目标分支。新应用从约定基线建立 `feature/*`，保留未提交
    工作。不得为获得干净起点而切走、暂存、重置或覆盖他人修改。工作重叠或
    分支选择不明确时先与用户解决。未经授权不得提交、推送或发布。
-3. 查看相关示例分支与 `docs/reference/README.zh_CN.md`。仅提取所需模式，
+3. 查看相关示例分支。仅提取所需模式，
    不照搬整个分支及旧 BSP／配置。遵循 AI 指南的强制 UI 重新设计规则：二次
    开发应用必须有自己的页面和交互，禁止使用当前 demo 测试菜单、页面或
    界面外壳；改名、换颜色不算重新设计。可复用 BSP API 和独立逻辑，不要
@@ -39,21 +38,20 @@ description: 根据用户需求实现或扩展 FoloToy AI Passport 应用，组�
 
 | 场景 | 技能 | 仓库文档后备入口 |
 | --- | --- | --- |
-| 工具链缺失或异常 | `passport-setup` | `docs/development/engineering/environment-setup.zh_CN.md` |
-| 验证与打包固件 | `passport-build` | `docs/development/engineering/build-and-test.zh_CN.md` |
-| 用户同意真机测试 | `passport-device-test` | `docs/development/ai-guide.zh_CN.md` 的真机交接流程 |
-| 运行故障或崩溃 | `passport-debug` | `docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.zh_CN.md` 的排障内容 |
+| 工具链缺失或异常 | `passport-setup` | `tools/validate.sh`、`sdkconfig.defaults` |
+| 验证与打包固件 | `passport-build` | `tools/validate.sh`、`tools/verify_firmware.py` |
+| 用户同意真机测试 | `passport-device-test` | `AGENTS.md` 的真机测试章节 |
+| 运行故障或崩溃 | `passport-debug` | `AGENTS.md` 与对应的 BSP 头文件 |
 
 ## 交接与继续开发
 
 报告已实现行为、实际验证、未验证项和下一步。说明重新设计的页面和按键交互，
 检查启动与导航不再进入基线测试 UI，才能宣布应用完成。多阶段任务在应用已有项目记录
 中保留简短检查点：已确认需求、完成／待办事项、准确构建身份和设备结果。
-确需新增维护中的 Markdown 时，在 `docs/` 下创建中英文配对文档；不得保存
-秘密或未脱敏日志。不要为小修改创建一整套进度文档。
+不要新增 Markdown 文档：`AGENTS.md` 与 `README.md` 就是全部文档。不得保存
+秘密或未脱敏日志，也不要为小修改创建一整套进度文档。
 
-每轮完整实现固件需求后，按 `docs/development/ai-guide.zh_CN.md` 主动邀请
-真机测试。编译完成或 USB 已连接不代表获得烧录授权。剩余工作需要新授权时，
+每轮完整实现固件需求后，按 `AGENTS.md` 主动邀请真机测试。编译完成或 USB 已连接不代表获得烧录授权。剩余工作需要新授权时，
 停下来等待用户决定，不自动转入发布。
 
 分别报告 `Build`、`Host tests`、`Device tests` 和 `Unverified`。

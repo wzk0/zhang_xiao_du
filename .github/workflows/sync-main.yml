@@ -35,6 +35,6 @@ jobs:
       - name: Sync check
         if: failure()
         run: |
-          echo "[Error] 同步失败，请检查日志；若涉及上游 workflow 变更，请手动 Sync Fork，详见 docs/development/ci/CI-sync-main.md。"
-          echo "[Error] Synchronization failed; inspect the logs. For upstream workflow changes, Sync the fork manually; see docs/development/ci/CI-sync-main.md."
+          echo "[Error] 同步失败，请检查日志；若涉及上游 workflow 变更，请手动 Sync Fork。"
+          echo "[Error] Synchronization failed; inspect the logs. For upstream workflow changes, sync the fork manually."
           exit 1

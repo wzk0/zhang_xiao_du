@@ -4,7 +4,9 @@
 
 # Repository Guidelines for AI Agents
 
-This file is the only mandatory entry point for AI-assisted work in this repository. Read task-specific documents from the routing table below; do not load every README by default.
+This file and the root `README.md` are the only maintained documents. Read this
+file first; for everything else the code is the reference: headers,
+neighbouring implementations, and `components/bsp/include/bsp_pins.h`.
 
 ## Required AI skills
 
@@ -29,42 +31,62 @@ retain the separate authorization requirements for flashing, Git writes, and pub
 ## Project and safety baseline
 
 - Target: ESP32-C3, 8 MB Flash, no PSRAM, ESP-IDF 5.5.3.
-- Keep the repository's default partition table minimal: NVS, PHY data, and
-  one factory application spanning the rest of the 8 MB Flash. User firmware
-  may deliberately change this layout; validate the resulting table and do not
-  turn product-specific partitions into mandatory template contracts.
-- Preserve existing user changes. Start with `git status --short --branch`; never overwrite or clean unrelated files.
-- Flashing new firmware does not require backing up the firmware already on the device; do not make a Flash readback a prerequisite. This does not guarantee preservation of user data or authorize a full-chip erase. Follow the [flashing and data policy](docs/development/engineering/firmware-layout.md#flashing-and-stored-data).
-- Hardware facts follow this priority: product specifications and measured results → `components/bsp/include/bsp_pins.h` → BSP headers and implementation → hardware guide → README/demo code. If a task requires a hardware detail not defined by these sources, ask the user instead of guessing.
-- Reusable board logic belongs in `components/bsp`; pages, state machines, animations, and application tasks belong in `main`.
-- Derivative applications must redesign and implement their own UI. Reusing the current demo test menu, screens, or visual shell is prohibited; renaming, recoloring, or adding a feature to that shell does not count as a redesign. BSP APIs and non-UI logic remain reusable. See the [mandatory UI redesign rule](docs/development/ai-guide.md#mandatory-ui-redesign-for-derivative-applications).
-- LVGL is not thread-safe. Code outside the LVGL task must hold `bsp_lvgl_lock()` while accessing LVGL objects.
-- Before adding Chinese UI text, follow the [font checklist](docs/development/engineering/coding-conventions.md#chinese-fonts-and-missing-glyphs). The default Montserrat fonts have no Chinese glyphs; UTF-8 and a successful build do not prove display support. Verify glyph coverage, widget font selection, and on-device rendering.
-- Button callbacks must stay non-blocking. Audio, storage, networking, and other slow operations belong in worker tasks.
-- A demo must stop every task, timer, callback, and event handler that can access its UI before deleting the screen.
-- Keep testable state machines, protocols, timing, and layout calculations independent from ESP-IDF/LVGL and cover them with host tests.
-- Never commit credentials, device QR secrets, private keys, personal data, or unsanitized logs.
-- Every maintained Markdown document outside the root README set uses English at its default `.md` path and Simplified Chinese in a paired `.zh_CN.md` file. Keep both versions aligned and retain reciprocal language links. This includes other root Markdown such as `AGENTS.md`. Root README files are exempt: `README.md` may use any language, and any number of `README.<tag>.md` versions may coexist; when multiple versions exist, keep every language link valid and reciprocal.
-- Root README scope follows the branch model. The `main` README catalogs the applications hosted on other branches; when development happens directly on `main`, it describes `main`'s own functionality instead. Every other branch's root README describes only that branch's application and must not list or advertise other branches' applications.
+- This checkout is an eBook reader (`main/reader_*`); `main/demo_*.c` are the
+  BSP demonstration pages, not the product.
+- Keep the default partition table minimal: NVS, PHY data, and one factory
+  application spanning the rest of the 8 MB Flash. User firmware may deliberately
+  change this layout; validate the resulting table and do not turn
+  product-specific partitions into mandatory template contracts.
+- Hardware facts follow this priority: product specifications and measured
+  results → `components/bsp/include/bsp_pins.h` → BSP headers and implementation
+  → this file → `README.md` and demo code. If a task needs a hardware detail
+  none of these defines, ask the user instead of guessing.
+- Reusable board logic belongs in `components/bsp`; pages, state machines,
+  animations, and application tasks belong in `main`.
+- Derivative applications must redesign and implement their own UI. Reusing the
+  demo test menu, screens, or visual shell is prohibited; renaming, recoloring,
+  or adding a feature to that shell is not a redesign. BSP APIs and non-UI logic
+  remain reusable.
+- LVGL is not thread-safe. Code outside the LVGL task must hold `bsp_lvgl_lock()`
+  while accessing LVGL objects.
+- Chinese UI text needs real glyph coverage. The Montserrat fonts have no Chinese
+  glyphs; UTF-8 source and a successful build prove nothing. Fonts are generated
+  into `assets/fonts/lv_font_reader_*.c` by `tools/gen_reader_font.py` from
+  `assets/fonts/charset.txt`, and `tests/test_reader_font_coverage.py` plus
+  `tools/gen_reader_font.py --check` gate the result. Verify coverage, widget
+  font selection, and on-device rendering before claiming text works.
+- Button callbacks must stay non-blocking. Audio, storage, networking, and other
+  slow operations belong in worker tasks.
+- A demo must stop every task, timer, callback, and event handler that can access
+  its UI before deleting the screen.
+- Keep testable state machines, protocols, timing, and layout calculations
+  independent from ESP-IDF/LVGL and cover them with host tests.
+- Never commit credentials, device QR secrets, private keys, personal data, or
+  unsanitized logs.
+
+## Documentation policy
+
+- `README.md` and this file pair are the whole documentation set. Do not add a
+  `docs/` tree, per-feature notes, or progress documents; put durable user-facing
+  facts in `README.md` and durable engineering rules in this file.
+- This pair is bilingual: English at `AGENTS.md`, Simplified Chinese at
+  `AGENTS.zh_CN.md`, with reciprocal top language links, aligned sections, and no
+  CJK prose in the English default.
+- `README.md` may use any language and needs no pair.
 
 ## Task-specific context routing
 
 | Task | Read before editing |
 | --- | --- |
-| Any code change | `docs/development/ai-guide.md`, relevant headers and neighboring implementation |
-| Application workflow or core skill setup | `skills/README.md`; ensure the five required skills are available, then use only the matching skill |
-| Environment bootstrap or missing toolchain | `docs/development/engineering/environment-setup.md` |
-| BSP, pins, buses, display, audio, battery | `docs/hardware-design/AI_HARDWARE_DEVELOPMENT_GUIDE.md`, `components/bsp/include/bsp_pins.h` |
-| Demo or menu | `main/demo.h`, `main/main.c`, the nearest `main/demo_*.c` implementation |
-| Chinese UI text or fonts | `docs/development/engineering/lvgl-chinese-fonts.md`, the application's font assets, configuration, and widget styles |
-| Wi-Fi connection or Bluetooth provisioning | `docs/development/engineering/wifi-provisioning.md`, the referenced `demo/blufi-provisioning` implementation |
-| Build, test, dependencies, partitions | `docs/development/engineering/build-and-test.md`, `docs/development/engineering/firmware-layout.md`, `sdkconfig.defaults`, `partitions.csv` |
-| CI or release | the matching file in `docs/development/ci/CI-*.md` and `.github/workflows/` |
-| Project completion | `docs/development/release/project-completion.md` (then the `issue-suggestions` or `experience-pr` skill) |
-| Documentation | `docs/contribution/doc-conventions.md`, `docs/README.md` |
-| Commit or PR | `docs/contribution/commit-and-pr.md` |
-
-Use `docs/README.md` for the product overview and the documentation index. For the detailed AI development workflow — context setup, source-of-truth priority, application/BSP boundary, runtime invariants, material placement, and delivery format — read `docs/development/ai-guide.md`. Fork-specific workflow is in `docs/fork-guide.md` and is not required for ordinary upstream development.
+| Any code change | `git status --short --branch`, the affected header, and the nearest implementation |
+| Application development or skill setup | `skills/README.md`, then only the matching skill |
+| Pins, buses, display, audio, battery | `components/bsp/include/bsp_pins.h`, the matching BSP header and source |
+| eBook reader state, layout, storage, transfer | `main/reader_*.h`, `main/reader_app.c`, `main/reader_ui.c` |
+| Chinese UI text or fonts | `assets/fonts/charset.txt`, `assets/fonts/reader_charset.h`, `tools/gen_reader_font.py`, `tests/test_reader_font_coverage.py` |
+| Wi-Fi, Bluetooth, low power | `main/demo_wifi.c`, `main/demo_ble.c`, `main/demo_low_power.c`, `components/bsp/include/bsp_button.h` |
+| Build, tests, partitioning | `tools/validate.sh`, `sdkconfig.defaults`, `partitions.csv` |
+| CI, release, flashed image | `.github/workflows/`, `tools/verify_firmware.py`, `tools/archive_firmware.py` |
+| Product overview and usage | `README.md` |
 
 ## Required validation and delivery
 
@@ -85,13 +107,17 @@ Device tests: PASS / FAIL / NOT RUN
 Unverified: remaining board, instrument, or user checks
 ```
 
-After each complete implementation of a user-requested firmware change,
-proactively ask whether to flash it to the device for testing; do not wait for
-a release request. If no device is detected, ask the user to turn it on and
-connect it to a computer USB port with a data-capable cable. Follow the
-[on-device testing handoff](docs/development/ai-guide.md#offer-on-device-testing)
-and obtain approval before flashing; detection alone is not consent.
+## Device testing and Git
 
-Create commits and push only when the user requests them or the active workflow explicitly requires them. Ordinary feature, application, and documentation pull requests must not edit `docs/CHANGELOG.md` or `docs/CHANGELOG.zh_CN.md`; describe user-visible behavior, compatibility, and release-flow impact in the pull-request body and authoritative documentation instead. During release preparation, the release maintainer aggregates merged user-visible changes into both changelog files before creating the tag.
-
-Community guidance is in `.github/CONTRIBUTING.md`, `.github/CODE_OF_CONDUCT.md`, `.github/SECURITY.md`, and `.github/SUPPORT.md`.
+- Flashing does not require backing up the firmware already on the device, and a
+  Flash readback is never a prerequisite. It also does not authorize a full-chip
+  erase or promise that user data survives.
+- After each complete implementation of a user-requested firmware change,
+  proactively ask whether to flash it for testing; do not wait for a release
+  request. If no device is detected, ask the user to turn it on and connect it to
+  a computer USB port with a data-capable cable. Detection alone is not consent:
+  obtain approval before flashing.
+- Create commits and push only when the user requests them or the active workflow
+  explicitly requires them. This repository has no changelog; describe
+  user-visible behavior, compatibility, and release-flow impact in the commit or
+  pull-request body.
