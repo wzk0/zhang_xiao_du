@@ -12,10 +12,18 @@ progress are unchanged.
   python3 tools/gen_builtin_books.py --check  # verify committed data is current
 
 The generated files are committed; normal builds never need to run this tool.
+
+`--check` is semantic, not byte-identical: raw-deflate output depends on the
+zlib build (zlib-ng and zlib 1.3 disagree by a few bytes on the same input), so
+it decodes the committed images and compares them with the canonical text
+instead of re-compressing. Regenerating on a different zlib build may change
+bytes without changing content; that diff is not worth committing.
 """
 from __future__ import annotations
 
+import re
 import sys
+import zlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -99,22 +107,77 @@ def render() -> tuple[str, str, list[tuple[str, int, int, int]]]:
     return "\n".join(h), "\n".join(c), meta
 
 
+ARRAY_RE = re.compile(
+    r"const unsigned char (g_builtin_zdx_\w+)\[(\d+)\] = \{(.*?)\n\};", re.S)
+
+
+def committed_images() -> dict[str, bytes]:
+    images: dict[str, bytes] = {}
+    text = OUT_C.read_text(encoding="utf-8")
+    for name, declared, body in ARRAY_RE.findall(text):
+        data = bytes(int(byte, 16) for byte in re.findall(r"0x([0-9A-Fa-f]{2})", body))
+        if len(data) != int(declared):
+            raise ValueError(
+                f"{OUT_C.name}: {name} declares {declared} bytes but holds {len(data)}")
+        images[name] = data
+    return images
+
+
+def check() -> bool:
+    """Decode the committed images and compare them with the canonical text."""
+    if not OUT_C.is_file() or not OUT_H.is_file():
+        print("ERROR: generated book data is missing; "
+              "run python3 tools/gen_builtin_books.py", file=sys.stderr)
+        return False
+    try:
+        images = committed_images()
+    except ValueError as error:
+        print(f"ERROR: {error}; run python3 tools/gen_builtin_books.py",
+              file=sys.stderr)
+        return False
+
+    header = OUT_H.read_text(encoding="utf-8")
+    errors: list[str] = []
+    for stem in ENTRIES:
+        name = f"g_builtin_zdx_{stem}"
+        blob = images.get(name)
+        if blob is None:
+            errors.append(f"{OUT_C.name}: missing {name}")
+            continue
+        try:
+            fields = zdx_codec.header_fields(blob)
+            decoded = zdx_codec.decode(blob)
+        except (ValueError, AssertionError, zlib.error) as error:
+            errors.append(f"{OUT_C.name}: {name} is not a valid zdx image: {error}")
+            continue
+        if decoded != extract_text(stem):
+            errors.append(f"{OUT_C.name}: {name} does not decode to "
+                          f"assets/books/{stem}.txt")
+        for expected in (
+            f"extern const unsigned char {name}[{len(blob)}];",
+            f"#define READER_ZDX_{stem.upper()}_ORIG_SIZE {fields['original_size']}u",
+            f"#define READER_ZDX_{stem.upper()}_TEXT_CHARS {fields['text_chars']}u",
+        ):
+            if expected not in header:
+                errors.append(f"{OUT_H.name}: missing or stale: {expected}")
+
+    for error in errors:
+        print(f"ERROR: {error}; run python3 tools/gen_builtin_books.py",
+              file=sys.stderr)
+    if errors:
+        return False
+    print("Builtin book data: PASS (committed images match assets/books/*.txt)")
+    return True
+
+
 def main() -> int:
+    if "--check" in sys.argv[1:]:
+        return 0 if check() else 1
+
     h, c, meta = render()
     for stem, raw_len, zdx_len, chars in meta:
         print(f"{stem}: {raw_len} B UTF-8 -> {zdx_len} B zdx "
               f"({100 * zdx_len // raw_len}%), chars={chars}")
-
-    if "--check" in sys.argv[1:]:
-        ok = True
-        for path, content in ((OUT_H, h), (OUT_C, c)):
-            if not path.is_file() or path.read_text(encoding="utf-8") != content:
-                print(f"ERROR: {path.relative_to(ROOT)} is stale; "
-                      f"run python3 tools/gen_builtin_books.py", file=sys.stderr)
-                ok = False
-        if ok:
-            print("Builtin book data: PASS (generated files current)")
-        return 0 if ok else 1
 
     OUT_H.write_text(h, encoding="utf-8")
     OUT_C.write_text(c, encoding="utf-8")
