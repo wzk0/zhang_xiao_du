@@ -12,14 +12,9 @@ with Pillow/FreeType and emitting the LVGL structures directly removes that
 toolchain from the trust path, and ``--verify`` re-parses the emitted C file and
 compares every glyph, pixel by pixel, against the rasterisation that produced it.
 
-Glyph contrast AND stroke uniformity
+Glyph contrast and stroke uniformity
 ------------------------------------
-LVGL maps 2bpp glyph levels through ``{0, 85, 170, 255}`` (see
-``opa2_table`` in lv_font_fmt_txt.c). On a 240x320 TFT ANY intermediate level
-reads as haze around a 1-pixel CJK stem, so the generator emits ONLY levels 0
-and 3 -- a pure bilevel bitmap. Grey antialiasing (``p >> 6``), the "ink
-boost" (coverage >= 64 -> solid, plus a faint fringe) and the 128/88 single
-cutoffs all looked washed out, blobby or skeletal on this panel.
+Bitmaps are packed at 1 bpp and decode to full opacity or transparency.
 
 A single global coverage cutoff is nevertheless *phase sensitive*. FreeType's
 antialiasing can give one horizontal stem a coverage of 200+ and an identical
@@ -39,30 +34,20 @@ everywhere, so no stroke depends on the antialiasing phase:
     called these sizes perfect, and tests/test_reader_font_coverage.py pins
     their emitted bitmaps by SHA-256 so a future edit cannot touch them.
   * 16 px uses the native 16x16 strike, lightly weighted (see below).
-  * 17-20 px UPSCALE the 16x16 strike to the selected size with deterministic
-    nearest-neighbour mapping. The previous Noto path was the source of the
-    "some places thick, some thin" report: FreeType's hinted skeleton gives
-    CJK horizontal stems 2 px but vertical stems 1 px (measured 2-px-run
-    ratio 0.41-0.76), and the grayscale core OR-ed in extra 2 px patches at
-    random phases, so 2x2 black blocks grew from 11 to 26 per glyph across
-    17-20 px. Nearest-neighbour upscaling distributes the extra rows/columns
-    evenly instead of at random, bringing the ratio to ~1.0 and cutting those
-    blocks by 37-83%. Scaling a native strike into a TIGHT Noto box was the
-    old bug; scaling it into its OWN square box is not.
-  * ASCII, punctuation and UI symbols keep the Noto path at every size:
+  * 17-20 px expand the 16x16 strike by inserting rows and
+    columns between source pixels. An inserted pixel extends a stroke only
+    where it connects to the next source row or column. Copying whole rows
+    and columns would double the thickness of whichever stems land there.
+  * Latin letters and Unicode punctuation use the Light face's hinted monochrome
+    bitmap. The Regular face still supplies their advance widths.
+  * Digits and other UI symbols keep the Regular Noto path:
     BDF punctuation boxes carry x/y offsets that would be distorted if
     stretched into the LVGL glyph box, and the hinted skeleton is crisp for
     them. That path is ``font.getmask2(ch, mode="1")`` (FreeType HINTED
     MONOCHROME bitmap) OR a grayscale stroke core >= STROKE_CORE_THRESHOLD.
 
-Weighting at >= 16 px: a dot-matrix Song face has 1 px horizontal stems but
-2 px vertical ones (measured vertical/horizontal 2-px-run ratio 1.89 at
-16 px), which reads as pale and uneven once the glyph grows. Filling only the
-inner concave corner -- an empty pixel whose left and upper neighbours are ink
-while the upper-left diagonal is empty -- rounds the joints, adds ~8% ink and
-brings that ratio to 0.85 at 16 px / ~1.0 at 17-20 px, without ever thickening
-a straight stem. It is purely structural and phase-free, and 2x2 blocks stay
-near zero at 16-17 px. 12-15 px deliberately skip this step.
+Weighting on the native 16 px strike fills inner concave corners.
+Other sizes skip the added corner pixels.
 
 The strike path uses the strike's OWN square em box (or its upscaled square
 box), not Noto's tight ``getbbox()``. Each ``==STRIKE`` header records the
@@ -97,8 +82,8 @@ the font rule in AGENTS.md for the coverage contract.
 The generated .c files, charset.txt and cjk_strikes.txt are committed; the
 source TTF/TTC and the original PCF fonts are not. Font sources:
 
-  * Noto Sans CJK SC (SIL Open Font License 1.1) -- ASCII, punctuation and
-    UI symbols only (and the advance widths for every Hanzi).
+  * Noto Sans CJK SC (SIL Open Font License 1.1) -- Light for Latin letters and punctuation,
+    Regular for digits, other UI symbols and all advance widths.
   * WenQuanYi bitmap-song, Debian package ``xfonts-wqy``
     (GPL-2-with-font-embedding-exception) -- native 12-16 px Hanzi dots,
     deterministically upscaled for 17-20 px. See
@@ -110,6 +95,7 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 # Pillow is imported lazily inside run_generate(): it is only needed to
@@ -121,8 +107,9 @@ ROOT = Path(__file__).resolve().parents[1]
 FONT_DIR = ROOT / "assets" / "fonts"
 CHARSET_FILE = FONT_DIR / "charset.txt"
 DEFAULT_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"
+DEFAULT_LATIN_FONT = "/usr/share/fonts/opentype/noto/NotoSansCJK-Light.ttc"
 DEFAULT_FACE_INDEX = 2  # Noto Sans CJK SC
-BPP = 2
+BPP = 1
 # Hanzi source strike for each selectable size. 12-14 px use their own native
 # strike verbatim; 15 px reuses 14 px unchanged; 16 px uses 16 px native;
 # 17-20 px deterministically upscale the 16 px strike to the selected size.
@@ -283,16 +270,33 @@ def load_strikes() -> tuple[dict[int, dict[int, list[list[int]]]], dict[int, int
     return strikes, baselines
 
 
-def upscale_strike(rows, src: int, dst: int) -> list[list[int]]:
-    """Deterministic nearest-neighbour map of a square strike to a square box.
+def stretch_strike_rows(rows, src: int, dst: int) -> list[list[int]]:
+    """Spread source rows across the target and bridge connected strokes."""
+    positions = [(r * (dst - 1) + (src - 1) // 2) // (src - 1)
+                 for r in range(src)]
+    out = [list(rows[0])]
+    for r in range(1, src):
+        upper, lower = rows[r - 1], rows[r]
+        if positions[r] - positions[r - 1] == 2:
+            # An existing straight path already joins neighbouring pixels
+            # across the gap. Add a diagonal bridge only when both possible
+            # straight paths are absent.
+            bridge = [a & b for a, b in zip(upper, lower)]
+            for c, pixel in enumerate(upper):
+                if not pixel or bridge[c]:
+                    continue
+                if any(lower[n] and not upper[n]
+                       for n in (c - 1, c + 1) if 0 <= n < len(upper)):
+                    bridge[c] = 1
+            out.append(bridge)
+        out.append(list(lower))
+    return out
 
-    Row r of the result reads row ``r*src//dst`` of the source, so the extra
-    rows/columns land at evenly spaced positions instead of at the random
-    phases of FreeType's antialiasing. Used only for 17-20 px, and only into
-    the strike's OWN square box (never into Noto's tight bbox).
-    """
-    return [[rows[(r * src) // dst][(c * src) // dst] for c in range(dst)]
-            for r in range(dst)]
+
+def upscale_strike(rows, src: int, dst: int) -> list[list[int]]:
+    expanded = stretch_strike_rows(rows, src, dst)
+    columns = stretch_strike_rows(list(zip(*expanded)), src, dst)
+    return [list(row) for row in zip(*columns)]
 
 
 def fill_inner_corners(rows, size: int) -> list[list[int]]:
@@ -317,7 +321,7 @@ def fill_inner_corners(rows, size: int) -> list[list[int]]:
 
 
 def strike_glyph(ch: str, info: dict) -> tuple[int, int, int, int, list[int]] | None:
-    """Full glyph geometry + 2bpp levels for a Hanzi in its OWN square box.
+    """Full glyph geometry and binary coverage for a Hanzi in its OWN square box.
 
     The square strike box (or its deterministic upscale) is used verbatim: no
     cropping into Noto's tight bbox. The baseline row scales with the bitmap
@@ -336,40 +340,16 @@ def strike_glyph(ch: str, info: dict) -> tuple[int, int, int, int, list[int]] | 
     dst = info["target_size"]
     if len(rows) != src or any(len(r) != src for r in rows):
         raise RuntimeError(f"U+{cp:04X}: strike box is not {src}x{src}")
+    if info["harmonize"]:
+        rows = fill_inner_corners(rows, src)
     if dst != src:
         rows = upscale_strike(rows, src, dst)
-    if info["harmonize"]:
-        rows = fill_inner_corners(rows, dst)
     baseline_row = (info["baseline_row"] * dst + src // 2) // src
-    vals = [3 if v else 0 for r in rows for v in r]
+    vals = [v for row in rows for v in row]
     return dst, dst, 0, baseline_row - dst, vals
 
 
-def quantize_stroke(gray: int, mono: int, bpp: int) -> int:
-    """Combine the hinted monochrome skeleton with the grayscale ink core.
-
-    For 2bpp we emit ONLY levels 0 and 3 (pure black and white):
-
-      * mono >= 128  (FreeType hinted 1bpp skeleton)            -> 3
-      * OR gray >= STROKE_CORE_THRESHOLD (a real stroke centre) -> 3
-      * otherwise                                                -> 0
-
-    The skeleton guarantees continuous, uniformly wide stems; the grayscale
-    core restores a little weight for ASCII and punctuation. Hanzi no longer
-    use this path at any size (see the module docstring). No intermediate
-    level is ever emitted: any 85/170-alpha pixel reads as haze on this panel.
-    tests/test_reader_font_coverage.py pins all sides of this contract: no
-    grey levels, enough ink pixels, AND that the generator still asks FreeType
-    for a hinted monochrome bitmap.
-    """
-    if bpp == 2:
-        return 3 if (mono >= 128 or gray >= STROKE_CORE_THRESHOLD) else 0
-    # Generic fallback for any future bpp: round to the nearest level.
-    max_level = (1 << bpp) - 1
-    return min(max_level, (gray * max_level + 127) // 255)
-
-
-def render_glyph(font, ch: str, ascent: int, bpp: int, strike_info=None):
+def render_glyph(font, latin_font, ch: str, ascent: int, bpp: int, strike_info=None):
     """Return (bitmap, box_w, box_h, ofs_x, ofs_y, adv_w, pixel_values).
 
     ``strike_info`` is ``{"size", "rows", "baseline_row"}`` for this size, or
@@ -387,6 +367,10 @@ def render_glyph(font, ch: str, ascent: int, bpp: int, strike_info=None):
             w, h, ox, oy, vals = g
             return pack_bits(vals, bpp), w, h, ox, oy, adv_w, vals
 
+    latin = ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+    light = latin or unicodedata.category(ch).startswith("P")
+    if light:
+        font = latin_font
     bbox = font.getbbox(ch)
     if bbox is None:
         return b"", 0, 0, 0, 0, adv_w, []
@@ -397,8 +381,6 @@ def render_glyph(font, ch: str, ascent: int, bpp: int, strike_info=None):
     # LVGL 9.5: glyph bottom = baseline - ofs_y, so ofs_y = ascent - bbox.bottom.
     ofs_y = ascent - y1
 
-    img = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(img).text((-x0, -y0), ch, font=font, fill=255)
     # FreeType's hinted monochrome bitmap snaps every stem onto the integer
     # pixel grid. Pillow returns an ImagingCore of 0/255 bytes in row-major
     # order; its size equals getbbox() for every code point in the inventory,
@@ -407,11 +389,16 @@ def render_glyph(font, ch: str, ascent: int, bpp: int, strike_info=None):
     mono = list(mono_mask)
     if len(mono) != w * h:
         raise RuntimeError(f"hinted bitmap size mismatch for U+{ord(ch):04X}")
-    vals = [quantize_stroke(p, m, bpp) for p, m in zip(img.tobytes(), mono)]
+    if light:
+        vals = [int(bool(pixel)) for pixel in mono]
+    else:
+        img = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(img).text((-x0, -y0), ch, font=font, fill=255)
+        vals = [int(bool(m) or p >= STROKE_CORE_THRESHOLD) for p, m in zip(img.tobytes(), mono)]
     return pack_bits(vals, bpp), w, h, x0, ofs_y, adv_w, vals
 
 
-def emit_font(size: int, out_path: Path, font, ascii_chars, cjk_chars, strike_info=None):
+def emit_font(size: int, out_path: Path, font, latin_font, ascii_chars, cjk_chars, strike_info=None):
     ascent, descent = font.getmetrics()
     line_height = size + EXTRA_LEADING
     all_chars = ascii_chars + cjk_chars
@@ -420,7 +407,7 @@ def emit_font(size: int, out_path: Path, font, ascii_chars, cjk_chars, strike_in
     dscs = [(0, 0, 0, 0, 0, 0)]  # glyph id 0 is reserved
     expected_pixels: list[list[int]] = [[]]
     for ch in all_chars:
-        bm, bw, bh, ox, oy, aw, vals = render_glyph(font, ch, ascent, BPP, strike_info)
+        bm, bw, bh, ox, oy, aw, vals = render_glyph(font, latin_font, ch, ascent, BPP, strike_info)
         dscs.append((len(bitmap), aw, bw, bh, ox, oy))
         bitmap += bm
         expected_pixels.append(vals)
@@ -433,13 +420,14 @@ def emit_font(size: int, out_path: Path, font, ascii_chars, cjk_chars, strike_in
     L.append("// Generated by tools/gen_reader_font.py; do not edit manually.")
     L.append("// Sources: Hanzi = WenQuanYi bitmap-song native strikes")
     L.append("//          (GPL-2-with-font-embedding-exception, shipped as cjk_strikes.txt);")
-    L.append("//          ASCII / punctuation / symbols = Noto Sans CJK SC (OFL 1.1, not redistributed).")
+    L.append("//          Latin letters and punctuation = Noto Sans CJK SC Light (OFL 1.1).")
+    L.append("//          Digits and other symbols = Noto Sans CJK SC Regular (OFL 1.1).")
     L.append(f"// size={size}px bpp={BPP} line_height={line_height} base_line={descent}")
     if strike_info is not None:
         src, dst = strike_info["size"], strike_info["target_size"]
         raster = f"native {src}px dot-matrix strike"
         if dst != src:
-            raster += f" upscaled to {dst}px"
+            raster += f" expanded to {dst}px with stroke bridges"
         if strike_info["harmonize"]:
             raster += " + inner-corner weighting"
         L.append(f"// Hanzi raster: {raster}")
@@ -560,10 +548,7 @@ def verify_font(path: Path, size: int, ascii_chars, cjk_chars, dscs, bitmap, exp
         raw = parsed_bitmap[bi:bi + nbytes]
         if len(raw) != nbytes:
             raise RuntimeError(f"{path.name}: truncated bitmap for glyph {gid}")
-        decoded: list[int] = []
-        for byte in raw:
-            for shift in (6, 4, 2, 0):
-                decoded.append((byte >> shift) & 3)
+        decoded = [(byte >> shift) & 1 for byte in raw for shift in range(7, -1, -1)]
         if decoded[: len(vals)] != list(vals):
             raise RuntimeError(f"{path.name}: pixel mismatch for {all_chars[gid-1]!r} (glyph {gid})")
 
@@ -634,7 +619,7 @@ def write_charset(ascii_chars, cjk_chars):
     return len(codepoints)
 
 
-def run_generate(font_path: str, face_index: int):
+def run_generate(font_path: str, latin_font_path: str, face_index: int):
     # Lazy import: the --check gate above never reaches this point, so a host
     # without Pillow can still validate the committed font inventory.
     global Image, ImageDraw, ImageFont
@@ -645,16 +630,19 @@ def run_generate(font_path: str, face_index: int):
               file=sys.stderr)
         raise SystemExit(1)
 
-    if not Path(font_path).exists():
-        sys.exit(f"Font not found: {font_path}")
+    for source in (font_path, latin_font_path):
+        if not Path(source).is_file():
+            sys.exit(f"Font not found: {source}")
     FONT_DIR.mkdir(parents=True, exist_ok=True)
     strikes, baselines = load_strikes()
     ascii_chars, cjk_chars = build_charset()
     print(f"Character inventory: {len(ascii_chars)} ASCII + {len(cjk_chars)} CJK/symbols")
-    print(f"Vector font: {font_path} (face index {face_index})")
+    print(f"Vector fonts: {font_path}, {latin_font_path} (face index {face_index})")
     print(f"Native strikes: {', '.join(f'{s}px={len(strikes[s])} baseline_row={baselines[s]}' for s in sorted(strikes))}")
+    advances = []
     for size in SIZES:
         font = ImageFont.truetype(font_path, size, index=face_index)
+        latin_font = ImageFont.truetype(latin_font_path, size, index=face_index)
         strike_info = None
         if size in BITMAP_STRIKE_FOR_SIZE:
             ss = BITMAP_STRIKE_FOR_SIZE[size]
@@ -663,10 +651,21 @@ def run_generate(font_path: str, face_index: int):
             target = ss if size < HARMONIZE_MIN_SIZE else size
             strike_info = {"size": ss, "target_size": target,
                            "rows": strikes[ss], "baseline_row": baselines[ss],
-                           "harmonize": size >= HARMONIZE_MIN_SIZE}
+                           "harmonize": size == HARMONIZE_MIN_SIZE}
         out = FONT_DIR / f"lv_font_reader_{size}.c"
-        dscs, bitmap, pixels, groups = emit_font(size, out, font, ascii_chars, cjk_chars, strike_info)
+        dscs, bitmap, pixels, groups = emit_font(size, out, font, latin_font, ascii_chars, cjk_chars, strike_info)
         verify_font(out, size, ascii_chars, cjk_chars, dscs, bitmap, pixels, groups)
+        advances.append([glyph[1] for glyph in dscs[1:len(ascii_chars) + 1]])
+    advance_header = FONT_DIR / "reader_ascii_advance.h"
+    rows = ["// Generated by tools/gen_reader_font.py. Units are 1/16 pixel.",
+            "#pragma once", "#include <stdint.h>",
+            "static const uint16_t reader_ascii_advance[][95] = {"]
+    for row in advances:
+        rows.append("    {")
+        for i in range(0, len(row), 15):
+            rows.append("        " + ", ".join(map(str, row[i:i + 15])) + ",")
+        rows.append("    },")
+    advance_header.write_text("\n".join(rows + ["};", ""]), encoding="utf-8")
     n = write_charset(ascii_chars, cjk_chars)
     print(f"Wrote {CHARSET_FILE.relative_to(ROOT)} ({n} code points)")
 
@@ -695,7 +694,9 @@ def run_check() -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--font", default=DEFAULT_FONT, help="TTF/OTF/TTC source font")
+    ap.add_argument("--font", default=DEFAULT_FONT, help="Regular TTF/OTF/TTC source font")
+    ap.add_argument("--latin-font", default=DEFAULT_LATIN_FONT,
+                    help="Light TTF/OTF/TTC source font for Latin letters")
     ap.add_argument("--face-index", type=int, default=DEFAULT_FACE_INDEX,
                     help="face index inside a TTC (2 = Noto Sans CJK SC)")
     ap.add_argument("--check", action="store_true",
@@ -703,7 +704,7 @@ def main() -> int:
     args = ap.parse_args()
     if args.check:
         return run_check()
-    run_generate(args.font, args.face_index)
+    run_generate(args.font, args.latin_font, args.face_index)
     return 0
 
 

@@ -18,15 +18,20 @@
 #define READER_AP_URL  "http://192.168.4.1"
 #define READER_MAX_UPLOAD_BYTES (512 * 1024)
 
+typedef enum {
+    READER_UPLOAD_IDLE,
+    READER_UPLOAD_RECEIVING,
+    READER_UPLOAD_SAVED,
+    READER_UPLOAD_FAILED,
+} reader_upload_state_t;
+
 typedef struct {
     bool active;
     bool client_ready;      // DHCP address assigned
     uint32_t client_count;
-    uint32_t total_uploads;
-    char last_message[96];
-    char last_upload[64];
-    uint32_t last_upload_size;
-    uint32_t last_unsupported;
+    reader_upload_state_t upload;
+    char upload_detail[64];  // stored book title or failure reason
+    uint32_t unsupported;
 } reader_transfer_status_t;
 
 // Starts AP + DNS + HTTP. Idempotent while active. Returns ESP_OK on success;

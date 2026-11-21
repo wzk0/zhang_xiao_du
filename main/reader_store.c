@@ -10,12 +10,15 @@
 
 #include "dirent.h"
 #include "esp_log.h"
+#include "esp_partition.h"
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "nvs.h"
 #include "sys/stat.h"
+#include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "reader_store";
@@ -40,7 +43,6 @@ static SemaphoreHandle_t s_progress_lock;
 static void bookmarks_load_locked(void);
 static void bookmarks_save_locked(void);
 static FILE *s_upload_fp;
-static char s_upload_target[READER_BOOK_ID_MAX];
 static SemaphoreHandle_t s_upload_lock;
 
 static void lock_init(void)
@@ -119,34 +121,100 @@ static void tmp_path(char *out, size_t out_size)
     snprintf(out, out_size, "%s/%s", BOOKS_BASE, READER_UPLOAD_TMP_NAME);
 }
 
-// Keep a filename safe for SPIFFS: no path separators, no leading/double dots,
-// no control characters. UTF-8 bytes (Chinese names) are preserved.
-static void sanitize_name(const char *in, char *out, size_t out_size)
-{
-    const size_t limit = 32;  // leaves room for the ".zdx" suffix
-    size_t o = 0;
-    for (const unsigned char *p = (const unsigned char *)in; *p && o < limit; ++p) {
-        unsigned char c = *p;
-        // Also reject characters that could break a JSON/HTML response.
-        if (c == '/' || c == '\\' || c == ':' || c < 0x20 || c == 0x7F ||
-            c == '"' || c == '\'' || c == '<' || c == '>' || c == '&') continue;
-        if (c == '.' && (o == 0 || (o > 0 && out[o - 1] == '.'))) continue;
-        out[o++] = (char)c;
-    }
-    out[o] = '\0';
-    if (o == 0) snprintf(out, out_size, "book");
+// SPIFFS counts the leading slash and NUL in its object-name limit.
+#define BOOK_ID_LIMIT (CONFIG_SPIFFS_OBJ_NAME_LEN - 2)
+#define BOOK_STEM_LIMIT (BOOK_ID_LIMIT - (sizeof(BOOK_EXT) - 1))
+#define REPLACE_BACKUP "/books/.replace.old"
+#define REPLACE_ID "/books/.replace.id"
 
-    // The web page always uploads a .zdx image. Strip any .txt/.zdx the user
-    // had in the picked filename and normalise to our single stored format.
-    size_t len = strlen(out);
-    if (len >= 4) {
-        if (strcmp(out + len - 4, ".txt") == 0 ||
-            strcmp(out + len - 4, ".zdx") == 0) {
-            out[len - 4] = '\0';
-            len -= 4;
+static bool valid_uploaded_id(const char *id)
+{
+    if (!id || id[0] == '.') return false;
+    size_t len = strlen(id);
+    return len > sizeof(BOOK_EXT) - 1 && len <= BOOK_ID_LIMIT &&
+           !strchr(id, '/') && !strchr(id, '\\') &&
+           strcmp(id + len - (sizeof(BOOK_EXT) - 1), BOOK_EXT) == 0;
+}
+
+static void sanitize_name(const char *in, char *out)
+{
+    size_t len = strlen(in);
+    if (len >= 4 && (!strcmp(in + len - 4, ".txt") || !strcmp(in + len - 4, BOOK_EXT))) {
+        len -= 4;
+    }
+    size_t used = 0;
+    size_t short_prefix = 0;
+    bool truncated = false;
+    for (size_t pos = 0; pos < len;) {
+        size_t width = 0;
+        uint32_t cp = reader_utf8_decode(in + pos, len - pos, &width);
+        pos += width;
+        if (cp == READER_INVALID_CP || cp < 0x20 || cp == 0x7F ||
+            (cp < 128 && strchr("/\\:\"'<>&", (int)cp))) continue;
+        if (cp == '.' && (used == 0 || out[used - 1] == '.')) continue;
+        if (used + width > BOOK_STEM_LIMIT || used + width + sizeof(BOOK_EXT) > READER_BOOK_ID_MAX) {
+            truncated = true;
+            break;
+        }
+        memcpy(out + used, in + pos - width, width);
+        used += width;
+        if (used + 9 <= BOOK_STEM_LIMIT && used + 9 + sizeof(BOOK_EXT) <= READER_BOOK_ID_MAX) {
+            short_prefix = used;
         }
     }
-    if (len + 4 < out_size) strcat(out, BOOK_EXT);
+    if (truncated) {
+        used = short_prefix + (size_t)snprintf(out + short_prefix,
+            READER_BOOK_ID_MAX - short_prefix, "~%08lx", (unsigned long)reader_book_id(in));
+    } else if (used == 0) {
+        memcpy(out, "book", 4);
+        used = 4;
+    }
+    memcpy(out + used, BOOK_EXT, sizeof(BOOK_EXT));
+}
+
+static bool books_partition_blank(void)
+{
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, BOOKS_LABEL);
+    if (!part) return false;
+    uint8_t block[512];
+    for (size_t offset = 0; offset < part->size; offset += sizeof(block)) {
+        size_t n = part->size - offset;
+        if (n > sizeof(block)) n = sizeof(block);
+        if (esp_partition_read(part, offset, block, n) != ESP_OK) return false;
+        for (size_t i = 0; i < n; ++i) {
+            if (block[i] != 0xff) return false;
+        }
+    }
+    return true;
+}
+
+static bool recover_replacement(void)
+{
+    struct stat st;
+    if (stat(REPLACE_BACKUP, &st) != 0) {
+        if (errno != ENOENT) return false;
+        remove(REPLACE_ID);
+        return true;
+    }
+
+    char id[READER_BOOK_ID_MAX] = {0};
+    FILE *journal = fopen(REPLACE_ID, "rb");
+    if (!journal) return false;
+    size_t len = fread(id, 1, sizeof(id) - 1, journal);
+    bool complete = !ferror(journal) && feof(journal) && strlen(id) == len;
+    fclose(journal);
+    if (!complete || !valid_uploaded_id(id)) return false;
+
+    char dst[READER_BOOK_ID_MAX + 16];
+    book_path(id, dst, sizeof(dst));
+    if (stat(dst, &st) == 0) {
+        if (remove(REPLACE_BACKUP) != 0) return false;
+    } else if (errno != ENOENT || rename(REPLACE_BACKUP, dst) != 0) {
+        return false;
+    }
+    remove(REPLACE_ID);
+    return true;
 }
 
 static void load_progress(void)
@@ -175,14 +243,23 @@ esp_err_t reader_store_init(void)
         .base_path = BOOKS_BASE,
         .partition_label = BOOKS_LABEL,
         .max_files = 4,
-        .format_if_mount_failed = true,  // a merged 0x0 flash leaves 0xFF here
+        .format_if_mount_failed = false,
     };
     err = esp_vfs_spiffs_register(&conf);
-    if (err != ESP_OK) {
-        ESP_LOGE(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(err));
-        return err;
+    if (err == ESP_FAIL && books_partition_blank()) {
+        conf.format_if_mount_failed = true;
+        err = esp_vfs_spiffs_register(&conf);
     }
-    s_spiffs_mounted = true;
+    s_spiffs_mounted = err == ESP_OK;
+    if (!s_spiffs_mounted) {
+        ESP_LOGE(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(err));
+    } else if (recover_replacement()) {
+        char stale[READER_BOOK_ID_MAX + 16];
+        tmp_path(stale, sizeof(stale));
+        remove(stale);
+    } else {
+        ESP_LOGE(TAG, "书籍替换恢复失败");
+    }
 
     err = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &s_nvs);
     if (err != ESP_OK) {
@@ -380,9 +457,32 @@ esp_err_t reader_store_begin_upload(const char *name, char *out_id, size_t out_i
     }
 
     char base[READER_BOOK_ID_MAX];
-    sanitize_name(name, base, sizeof(base));
+    sanitize_name(name, base);
+    if (strlen(base) >= out_id_size || !recover_replacement()) {
+        xSemaphoreGive(s_upload_lock);
+        return ESP_FAIL;
+    }
+    char dst[READER_BOOK_ID_MAX + 16];
+    book_path(base, dst, sizeof(dst));
+    struct stat st;
+    if (stat(dst, &st) != 0) {
+        if (errno != ENOENT) {
+            xSemaphoreGive(s_upload_lock);
+            return ESP_FAIL;
+        }
+        reader_book_info_t *books = malloc(READER_MAX_BOOKS * sizeof(*books));
+        if (!books) {
+            xSemaphoreGive(s_upload_lock);
+            return ESP_ERR_NO_MEM;
+        }
+        int count = reader_store_list(books, READER_MAX_BOOKS);
+        free(books);
+        if (count == READER_MAX_BOOKS) {
+            xSemaphoreGive(s_upload_lock);
+            return ESP_ERR_INVALID_SIZE;
+        }
+    }
     snprintf(out_id, out_id_size, "%s", base);
-    snprintf(s_upload_target, sizeof(s_upload_target), "%s", base);
 
     char path[READER_BOOK_ID_MAX + 16];
     tmp_path(path, sizeof(path));
@@ -466,15 +566,36 @@ static int verify_and_count(const char *path, uint32_t *unsupported_out)
     return 0;
 }
 
+static bool commit_upload(const char *tmp, const char *dst, const char *id)
+{
+    struct stat st;
+    if (stat(dst, &st) != 0) {
+        return errno == ENOENT && rename(tmp, dst) == 0;
+    }
+
+    FILE *journal = fopen(REPLACE_ID, "wb");
+    if (!journal) return false;
+    size_t len = strlen(id);
+    bool written = fwrite(id, 1, len, journal) == len;
+    if (fclose(journal) != 0) written = false;
+    if (!written || rename(dst, REPLACE_BACKUP) != 0) return false;
+
+    // Recovery restores the old file if the final rename failed or power was
+    // lost before it. Once the destination exists, the replacement is committed.
+    bool committed = rename(tmp, dst) == 0;
+    if (!recover_replacement()) ESP_LOGE(TAG, "书籍替换恢复失败");
+    return committed;
+}
+
 esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
 {
-    if (!id || !s_upload_lock) return ESP_ERR_INVALID_ARG;
+    if (!valid_uploaded_id(id) || !s_upload_lock) return ESP_ERR_INVALID_ARG;
     if (xSemaphoreTake(s_upload_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
     if (!s_upload_fp) {
         xSemaphoreGive(s_upload_lock);
         return ESP_ERR_INVALID_STATE;
     }
-    fclose(s_upload_fp);
+    int close_result = fclose(s_upload_fp);
     s_upload_fp = NULL;
 
     char tmp[READER_BOOK_ID_MAX + 16];
@@ -483,16 +604,14 @@ esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
     book_path(id, dst, sizeof(dst));
 
     uint32_t unsupported = 0;
-    if (verify_and_count(tmp, &unsupported) != 0) {
+    if (close_result != 0 || verify_and_count(tmp, &unsupported) != 0) {
         ESP_LOGW(TAG, "上传文件不是有效的 zdx 或已损坏: %s", tmp);
         remove(tmp);
         xSemaphoreGive(s_upload_lock);
         return ESP_ERR_INVALID_ARG;
     }
-    // Replace any existing book with the same name atomically enough for SPIFFS.
     zdx_cache_close();  // invalidate any decoder pointing at the old file
-    remove(dst);
-    esp_err_t err = (rename(tmp, dst) == 0) ? ESP_OK : ESP_FAIL;
+    esp_err_t err = commit_upload(tmp, dst, id) ? ESP_OK : ESP_FAIL;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "保存上传书籍失败: %s", dst);
         remove(tmp);
@@ -521,8 +640,7 @@ void reader_store_abort_upload(void)
 
 esp_err_t reader_store_delete(const char *id)
 {
-    if (!id || id[0] == '\0' || !s_spiffs_mounted) return ESP_ERR_INVALID_ARG;
-    if (strncmp(id, "builtin:", 8) == 0) return ESP_ERR_NOT_SUPPORTED;
+    if (!valid_uploaded_id(id) || !s_spiffs_mounted) return ESP_ERR_INVALID_ARG;
     if (s_zdx_open && strcmp(s_zdx_id, id) == 0) zdx_cache_close();
     char path[READER_BOOK_ID_MAX + 16];
     book_path(id, path, sizeof(path));

@@ -19,8 +19,7 @@ and fails when:
   * OR the square strike is squeezed into Noto's tight glyph box again: that
     distorts each character by a different factor and deletes the single
     horizontal stem of 一 entirely;
-  * OR the 12-15 px bitmaps change at all: the reader called those sizes
-    perfect, so their glyph data is pinned by SHA-256 and must stay frozen;
+  * OR glyphs other than punctuation change: their pixels and advances are pinned;
   * OR 16-20 px regresses to phase-sensitive stems: the old grayscale core
     produced 2x2 black blocks and horizontal/vertical stems of different
     widths ("some places thicker, some thinner"), so a sampled stroke-balance
@@ -35,6 +34,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -153,54 +153,36 @@ HINTED_MONO_RE = re.compile(r'getmask2\(ch, mode="1"\)')
 #
 # ALL nine sizes draw Hanzi from the designed native dot-matrix strikes:
 # 12-14 px native, 15 px = 14 px strike, 16 px native, and 17-20 px as a
-# deterministic nearest-neighbour upscale of the 16 px strike. Only ASCII,
+# stroke-preserving expansion of the 16 px strike. Only ASCII,
 # punctuation and UI symbols still use FreeType's hinted monochrome skeleton
 # plus a grayscale stroke core. Pinned here:
 #   (1) a pure bitmap can be too sparse -- per-size ink-pixel floors are kept;
 #   (2) the hinted skeleton must stay in the generator for the glyphs that
 #       still use it, and the core cutoff must stay in the stroke-core band;
 #   (3) the native strikes must cover every Hanzi in the inventory;
-#   (4) 12-15 px are frozen by SHA-256 (reader: "16px 以下完美");
+#   (4) approved glyphs and advances are frozen by SHA-256;
 #   (5) 16-20 px must keep balanced horizontal/vertical stems and a low 2x2
 #       black-block count -- the old grayscale core made them phase-sensitive.
 CORE_MIN, CORE_MAX = 160, 224
 MIN_INK_RATIO = 0.90
-# level-3 pixel counts of the committed fonts (90% is the floor).
-# 16 px gained ~8% ink from inner-corner weighting ("稍深一点点"); 17-20 px
-# are leaner than the old Noto skeleton because the upscaled 1-pixel stems no
-# longer carry random 2 px patches. 一 keeps its near-full-width stem.
+# Solid-ink counts for the native and expanded strikes.
 BASELINE_INK = {
     12: 219646, 13: 238924, 14: 259100,
-    15: 259495, 16: 309064, 17: 322437,
-    18: 365541, 19: 411907, 20: 452402,
+    15: 259484, 16: 309064, 17: 311803,
+    18: 333500, 19: 356543, 20: 370779,
 }
 
 
 def check_glyph_contrast(path: Path) -> None:
     """Pin the crisp-glyph rasterisation contract in the committed bitmaps."""
     text = path.read_text(encoding="utf-8")
-    if not re.search(r"\.bpp = 2,", text):
-        raise RuntimeError(f"{path.name}: expected a 2bpp PLAIN font")
+    if not re.search(r"\.bpp = 1,", text):
+        raise RuntimeError(f"{path.name}: expected a 1bpp PLAIN font")
     m = GLYPH_BITMAP_RE.search(text)
     if not m:
         raise RuntimeError(f"{path.name}: cannot find glyph_bitmap")
     data = bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", m.group(1)))
-    if not data:
-        raise RuntimeError(f"{path.name}: empty glyph bitmap")
-
-    levels = [0, 0, 0, 0]
-    for byte in data:
-        levels[(byte >> 6) & 3] += 1
-        levels[(byte >> 4) & 3] += 1
-        levels[(byte >> 2) & 3] += 1
-        levels[byte & 3] += 1
-    if levels[1] or levels[2]:
-        raise RuntimeError(
-            f"{path.name}: {levels[1]} 85-alpha + {levels[2]} 170-alpha grey "
-            "pixels; glyphs must be pure black/white, regenerate with "
-            "tools/gen_reader_font.py to restore crisp strokes"
-        )
-    ink = levels[1] + levels[2] + levels[3]
+    ink = sum(byte.bit_count() for byte in data)
     if ink == 0:
         raise RuntimeError(f"{path.name}: no ink pixels at all")
 
@@ -210,9 +192,9 @@ def check_glyph_contrast(path: Path) -> None:
         raise RuntimeError(f"{path.name}: cannot determine font size")
     size = int(m_size.group(1))
     floor = int(BASELINE_INK[size] * MIN_INK_RATIO)
-    if levels[3] < floor:
+    if ink < floor:
         raise RuntimeError(
-            f"{path.name}: only {levels[3]} solid ink pixels, need at least "
+            f"{path.name}: only {ink} solid ink pixels, need at least "
             f"{floor} ({MIN_INK_RATIO:.0%} of baseline); thin 12 px strokes "
             "are being deleted, regenerate and check the skeleton"
         )
@@ -397,16 +379,10 @@ def check_native_geometry(path: Path) -> None:
     gid = cmap.get(0x4E00)
     if gid is None or gid >= len(parsed):
         raise RuntimeError(f"{path.name}: U+4E00 一 is missing from the font")
-    bi, _aw, bw, bh, _ox, _oy = parsed[gid]
+    _bi, _aw, bw, _bh, _ox, _oy = parsed[gid]
     data = bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", m.group(1)))
-    raw = data[bi:bi + (bw * bh * 2 + 7) // 8]
-    vals: list[int] = []
-    for byte in raw:
-        for shift in (6, 4, 2, 0):
-            vals.append((byte >> shift) & 3)
-    vals = vals[:bw * bh]
-    widest = max(sum(1 for v in vals[r * bw:(r + 1) * bw] if v == 3)
-                 for r in range(bh))
+    _, _, rows = _glyph_bitmap(gid, parsed, data)
+    widest = max(map(sum, rows))
     if widest < bw - 2:
         raise RuntimeError(
             f"{path.name}: U+4E00 一 has only a {widest}/{bw}px widest stem; "
@@ -414,48 +390,114 @@ def check_native_geometry(path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12-15 px freeze and >=16 px stroke balance
+# 12-16 px freeze and >=16 px stroke balance
 # ---------------------------------------------------------------------------
-# The reader described 12-15 px as perfect and asked for only a slight change
-# at 16 px. Hash the three emitted data arrays (comments excluded) so those
-# four sizes cannot drift by even one pixel or advance in a future edit.
-FROZEN_SIZES = (12, 13, 14, 15)
+# Hash non-Latin bitmaps and metrics, Latin advances, and cmap geometry.
+FROZEN_SIZES = tuple(range(12, 21))
 FROZEN_DATA_SHA256 = {
-    12: "c114b4da2b2c99381925d66c418ffe953a895be4f8534cee9d040e7760c66d1e",
-    13: "5991bd4d365d844920260b123765189a4eb000763abf52bfcd9d47f5b80f8d02",
-    14: "2bdfd7040940ea5a98141c96920b88e45f8be62992c3a4c65c1a24987f5f1ccd",
-    15: "0b1c207cdf1d33779cca1d51eda78d15f38988e7ee05121d3ea557ffae587836",
+    12: "921075352d003b1a4d0a3402d3af015b00ed5dcbc97faa58783e9f64c608367d",
+    13: "447d8311f86bbc1d9919810bd88486dbc45f5114cd46db39ec819b230136212e",
+    14: "230653e7ba0f413a81edfcc31be37a95f37d6b8d6e2a562425933704affa6bd9",
+    15: "4474c8fffeddbe4b1c0dd00c3a2db6fdea64045b35511eb79a91ae4dc3cceed2",
+    16: "c98ae1ec3910574439355b7b2d6b383dfdee12e315aa25d6a89378fdf8c975fe",
+    17: "e62fbde3e1984d0f1be88f1e6c353b7910fbcddf4e9300e101c5f558dc54608f",
+    18: "a24dfc067b62f8b1fb6bf814fbf79d022c3c4330af83728440fa03a0344719eb",
+    19: "6bc83738c3405563ce3ef0dd8123ca9aa774f508e2806cb8348a0787d135b72e",
+    20: "65944540ae9bb3f48391afe2a4793e8d0ad4c89f7830318eaa665886f72a769c",
 }
 
 
-def _font_data_blob(text: str) -> str:
-    parts: list[str] = []
-    for name in ("glyph_bitmap", "glyph_dsc", "cmaps"):
-        m = re.search(rf"{name}\[\] = \{{(.*?)\}};", text, re.S)
-        if not m:
-            raise RuntimeError(f"cannot find {name}[] to hash")
-        parts.append(m.group(1))
-    return "".join(parts)
+LATIN_GIDS = {cp - 31 for lo, hi in ((ord("A"), ord("Z")), (ord("a"), ord("z")))
+              for cp in range(lo, hi + 1)}
+LATIN_LIGHT_INK = {12: 946, 13: 1028, 14: 1149, 15: 1160, 16: 1280,
+                   17: 1369, 18: 1493, 19: 1644, 20: 1756}
+
+
+def _font_data_blob(text: str) -> bytes:
+    bitmap = bytes(int(x, 16) for x in re.findall(
+        r"0x([0-9A-Fa-f]{2})", GLYPH_BITMAP_RE.search(text).group(1)))
+    dsc = re.search(r"glyph_dsc\[\] = \{(.*?)\};", text, re.S)
+    glyphs = [tuple(map(int, row)) for row in re.findall(
+        r"\{\.bitmap_index = (\d+), \.adv_w = (\d+), \.box_w = (\d+), "
+        r"\.box_h = (\d+), \.ofs_x = (-?\d+), \.ofs_y = (-?\d+)\}", dsc.group(1))]
+    cmaps = re.search(r"cmaps\[\] = \{(.*?)\};", text, re.S)
+    data = bytearray(cmaps.group(1).encode())
+    codepoints = sorted(int(cp, 16) for cp in INVENTORY_RE.findall(
+        CHARSET_FILE.read_text(encoding="utf-8")))
+    bpp = int(re.search(r"\.bpp = (\d+),", text).group(1))
+    for gid, (offset, advance, w, h, x, y) in enumerate(glyphs):
+        if gid and unicodedata.category(chr(codepoints[gid - 1])).startswith("P"):
+            data.extend(f"{advance};".encode())
+        else:
+            data.extend(f"{advance},{w},{h},{x},{y};".encode())
+            mask = (1 << bpp) - 1
+            for i in range(w * h):
+                bit = i * bpp
+                level = (bitmap[offset + bit // 8] >> (8 - bpp - bit % 8)) & mask
+                data.append(int(bool(level)))
+    return bytes(data)
 
 
 def check_frozen_small_sizes() -> None:
-    """12-15 px must stay byte-for-byte identical (reader: perfect)."""
+    """Pin approved glyphs and advances, allowing punctuation to change."""
     for size in FROZEN_SIZES:
         path = FONT_DIR / f"lv_font_reader_{size}.c"
         digest = hashlib.sha256(
-            _font_data_blob(path.read_text(encoding="utf-8")).encode()
+            _font_data_blob(path.read_text(encoding="utf-8"))
         ).hexdigest()
         if digest != FROZEN_DATA_SHA256[size]:
             raise RuntimeError(
-                f"{path.name}: frozen {size}px glyph data changed (SHA-256 "
-                f"{digest[:12]}...); 12-15 px must not be touched")
+                f"{path.name}: frozen {size}px glyph data or advances changed (SHA-256 "
+                f"{digest[:12]}...)")
 
 
-# Sampled 2x2 black-block density (per glyph) and vertical/horizontal 2-px-run
-# ratio. Measured on the committed upscaled+weighted fonts (sample = every 8th
-# Hanzi); the old grayscale core produced 10.9-26.2 blocks/glyph and a ratio
-# of 0.4-0.76 at 17-20 px, and unweighted 16 px had a ratio of 1.89.
-BLOCK_CEILING = {16: 4.0, 17: 6.0, 18: 12.0, 19: 18.0, 20: 22.0}
+def check_ascii_advances(sizes: tuple[int, ...]) -> None:
+    source = (FONT_DIR / "reader_ascii_advance.h").read_text(encoding="utf-8")
+    table = source.split("reader_ascii_advance[][95] = {", 1)[1]
+    actual = [int(value) for value in re.findall(r"\d+", table)]
+    expected = []
+    for size in sizes:
+        text = (FONT_DIR / f"lv_font_reader_{size}.c").read_text(encoding="utf-8")
+        expected.extend(int(advance) for advance in re.findall(r"\.adv_w = (\d+)", text)[1:96])
+    if actual != expected:
+        raise RuntimeError("reader_ascii_advance.h does not match the shipped glyph widths")
+
+
+def check_strike_expansion() -> None:
+    from runpy import run_path
+
+    generator = run_path(str(ROOT / "tools" / "gen_reader_font.py"))
+    upscale = generator["upscale_strike"]
+    stretch = generator["stretch_strike_rows"]
+    corner = [[0] * 16 for _ in range(16)]
+    corner[7][6:8] = [1, 1]
+    corner[8][7] = 1
+    if stretch(corner, 16, 17)[8] != corner[8]:
+        raise RuntimeError("Expansion added ink alongside a connected corner")
+    for size in range(17, 21):
+        for stem in range(16):
+            horizontal = [[int(r == stem)] * 16 for r in range(16)]
+            vertical = [list(row) for row in zip(*horizontal)]
+            for strike in (horizontal, vertical):
+                expanded = upscale(strike, 16, size)
+                if sum(map(sum, expanded)) != size:
+                    raise RuntimeError(f"{size}px: 1px stem at {stem} changed thickness")
+        for slope in (-1, 1):
+            diagonal = [[int(c == (r if slope == 1 else 15 - r))
+                         for c in range(16)] for r in range(16)]
+            expanded = upscale(diagonal, 16, size)
+            columns = [{c for c, pixel in enumerate(row) if pixel} for row in expanded]
+            if not all(columns) or any(
+                not any(abs(a - b) <= 1 for a in upper for b in lower)
+                for upper, lower in zip(columns, columns[1:])
+            ):
+                raise RuntimeError(f"{size}px: expansion broke a diagonal stroke")
+
+
+# Sampled 2x2 black-block density and vertical/horizontal 2-pixel run ratio.
+# Large strikes extend the unweighted source, so 17 px retains slightly more
+# of the native Song face's vertical weight.
+BLOCK_CEILING = {16: 4.0, 17: 1.0, 18: 1.0, 19: 1.0, 20: 1.0}
 BALANCE_MIN, BALANCE_MAX = 0.65, 1.45
 
 
@@ -473,26 +515,21 @@ def _runs(seq) -> list[int]:
     return out
 
 
-def _hanzi_bitmap(text: str, gid: int, parsed, data: bytes):
+def _glyph_bitmap(gid: int, parsed, data: bytes):
     if gid >= len(parsed):
         return None
     bi, _aw, bw, bh, _ox, _oy = parsed[gid]
     if bw == 0 or bh == 0:
         return None
-    raw = data[bi:bi + (bw * bh * 2 + 7) // 8]
-    vals: list[int] = []
-    for byte in raw:
-        for shift in (6, 4, 2, 0):
-            vals.append(1 if (byte >> shift) & 3 == 3 else 0)
+    raw = data[bi:bi + (bw * bh + 7) // 8]
+    vals = [(byte >> shift) & 1 for byte in raw for shift in range(7, -1, -1)]
     vals = vals[:bw * bh]
     return bw, bh, [vals[r * bw:(r + 1) * bw] for r in range(bh)]
 
 
 def check_stroke_balance(path: Path) -> None:
-    """16-20 px: balanced stems, no phase-sensitive 2x2 black blocks."""
+    """Check the Latin alphabet and sampled Hanzi stroke weight."""
     size = int(re.search(r"_(\d+)\.c$", path.name).group(1))
-    if size < 16:
-        return
     text = path.read_text(encoding="utf-8")
     cmaps = re.search(r"cmaps\[\] = \{(.*?)\};", text, re.S)
     dsc = re.search(r"glyph_dsc\[\] = \{(.*?)\};", text, re.S)
@@ -513,6 +550,19 @@ def check_stroke_balance(path: Path) -> None:
         r"\.box_h = (\d+), \.ofs_x = (-?\d+), \.ofs_y = (-?\d+)\}", dsc.group(1))]
     data = bytes(int(x, 16) for x in re.findall(r"0x([0-9A-Fa-f]{2})", m.group(1)))
 
+    latin_ink = 0
+    for gid in LATIN_GIDS:
+        glyph = _glyph_bitmap(gid, parsed, data)
+        ink = sum(map(sum, glyph[2])) if glyph else 0
+        if not ink:
+            raise RuntimeError(f"{path.name}: Latin letter {chr(gid + 31)} lost its ink")
+        latin_ink += ink
+    expected_ink = LATIN_LIGHT_INK[size]
+    if not (0.95 * expected_ink <= latin_ink <= 1.05 * expected_ink):
+        raise RuntimeError(f"{path.name}: Latin stroke weight differs from the Light face")
+    if size < 16:
+        return
+
     han_gids = [cmap[cp] for cp in sorted(cmap)
                 if 0x4E00 <= cp <= 0x9FFF and cp in cmap]
     sample = han_gids[::8]
@@ -520,7 +570,7 @@ def check_stroke_balance(path: Path) -> None:
         raise RuntimeError(f"{path.name}: no Hanzi to sample")
     blocks = h2 = v2 = 0
     for gid in sample:
-        g = _hanzi_bitmap(text, gid, parsed, data)
+        g = _glyph_bitmap(gid, parsed, data)
         if not g:
             continue
         bw, bh, rows = g
@@ -538,10 +588,11 @@ def check_stroke_balance(path: Path) -> None:
             f"{path.name}: {density:.1f} 2x2 black blocks/glyph exceeds "
             f"{BLOCK_CEILING[size]}; phase-sensitive 2 px strokes returned "
             "('some places thicker, some thinner')")
-    if not (BALANCE_MIN <= ratio <= BALANCE_MAX):
+    upper_ratio = 1.75 if size == 17 else BALANCE_MAX
+    if not (BALANCE_MIN <= ratio <= upper_ratio):
         raise RuntimeError(
             f"{path.name}: vertical/horizontal 2-px stroke ratio {ratio:.2f} "
-            f"outside {BALANCE_MIN}..{BALANCE_MAX}; stems are uneven")
+            f"outside {BALANCE_MIN}..{upper_ratio}; stems are uneven")
 
 
 def check_charset_header(inventory: set[int]) -> None:
@@ -605,6 +656,7 @@ def main() -> int:
             errors.append(str(exc))
     try:
         check_generator_contract()
+        check_strike_expansion()
     except RuntimeError as exc:
         errors.append(str(exc))
     try:
@@ -613,6 +665,7 @@ def main() -> int:
         errors.append(str(exc))
     try:
         check_frozen_small_sizes()
+        check_ascii_advances(sizes)
     except RuntimeError as exc:
         errors.append(str(exc))
     try:
@@ -626,7 +679,7 @@ def main() -> int:
         print("Regenerate fonts with: python3 tools/gen_reader_font.py", file=sys.stderr)
         return 1
     print(f"reader_font_coverage: PASS ({len(inventory)} code points, "
-          f"{len(fonts)} crisp 2bpp font files, {sizes[0]}..{sizes[-1]} px)")
+          f"{len(fonts)} crisp 1bpp font files, {sizes[0]}..{sizes[-1]} px)")
     return 0
 
 

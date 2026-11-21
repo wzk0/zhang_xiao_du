@@ -45,7 +45,7 @@ ul{list-style:none;padding:0;margin:0}
 li{display:flex;justify-content:space-between;align-items:center;gap:8px;
  padding:9px 2px;border-bottom:1px solid var(--line);font-size:13px}
 li span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-li a{color:var(--accent);text-decoration:none;font-size:12px;flex-shrink:0}
+li button{width:auto;padding:0;background:transparent;color:var(--accent);font-size:12px;flex-shrink:0}
 .tag{font-size:11px;color:#6b6152;flex-shrink:0}
 </style>
 </head>
@@ -100,28 +100,50 @@ function fmtSize(b){
 }
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+var refreshSequence=0;
 function refresh(){
-  fetch('/space').then(function(r){return r.json();}).then(function(d){
-    document.getElementById('free').textContent=fmtSize(d.free);
+  var sequence=++refreshSequence;
+  Promise.all([
+    fetch('/space').then(function(r){return r.ok?r.json():null;}).catch(function(){return null;}),
+    fetch('/list').then(function(r){if(!r.ok) throw Error();return r.json();})
+  ]).then(function(result){
+    if(sequence!==refreshSequence) return;
+    var d=result[0], books=result[1];
+    document.getElementById('free').textContent=d?fmtSize(d.free):'读取失败';
     document.getElementById('detail').textContent=
-      '总计 '+fmtSize(d.total)+'　已用 '+fmtSize(d.used)+'　共 '+d.files+' 本上传书籍';
-    var pct=d.total?Math.round(d.used*100/d.total):0;
+      (d?'总计 '+fmtSize(d.total)+'　已用 '+fmtSize(d.used)+'　':'')+
+      '共 '+books.length+' 本上传书籍';
+    var pct=d&&d.total?Math.round(d.used*100/d.total):0;
     document.getElementById('bar').style.width=pct+'%';
-  }).catch(function(){});
-  fetch('/list').then(function(r){return r.json();}).then(function(d){
-    var ul=document.getElementById('list');ul.innerHTML='';
-    if(!d.length){ul.innerHTML='<li><span>（暂无上传书籍）</span></li>';return;}
-    d.forEach(function(b){
+    var ul=document.getElementById('list');ul.textContent='';
+    if(!books.length){ul.innerHTML='<li><span>（暂无上传书籍）</span></li>';return;}
+    books.forEach(function(b){
       var li=document.createElement('li');
-      li.innerHTML='<span>'+esc(b.name)+'</span><span class="tag">'+fmtSize(b.size)+'</span>'+
-        '<a href="/delete?name='+encodeURIComponent(b.name)+'">删除</a>';
-      ul.appendChild(li);
+      var title=document.createElement('span'), size=document.createElement('span');
+      var action=document.createElement('button');
+      title.textContent=b.name;size.textContent=fmtSize(b.size);size.className='tag';
+      action.textContent='删除';action.type='button';
+      action.onclick=function(){
+        if(!confirm('删除《'+b.name+'》及阅读记录？')) return;
+        action.disabled=true;
+        fetch('/delete?id='+encodeURIComponent(b.id),{method:'POST'})
+          .then(function(r){return r.json();}).then(function(d){
+            document.getElementById('msg').textContent=d.ok?'已删除《'+b.name+'》':d.error;
+          }).catch(function(){
+            document.getElementById('msg').textContent='删除失败，请重试';
+          }).then(refresh);
+      };
+      li.appendChild(title);li.appendChild(size);li.appendChild(action);ul.appendChild(li);
     });
-  }).catch(function(){});
+  }).catch(function(){
+    if(sequence!==refreshSequence) return;
+    document.getElementById('free').textContent='读取失败';
+    document.getElementById('detail').textContent='请保持热点连接';
+  });
 }
 
 // ---- 编码检测 -------------------------------------------------------------
-var pendingBlob=null, gConvertedText=null;
+var pendingBlob=null, gConvertedText=null, fileSequence=0;
 function detect(buf){
   var b=new Uint8Array(buf);
   if(b.length>=3 && b[0]===0xEF && b[1]===0xBB && b[2]===0xBF) return 'utf8-bom';
@@ -214,7 +236,7 @@ previewBtn.addEventListener('click',function(){
 });
 
 document.getElementById('file').addEventListener('change',function(){
-  var f=this.files[0];
+  var f=this.files[0], sequence=++fileSequence;
   pendingBlob=null; encBox.className=''; encBox.innerHTML='';
   highlightGuide(false,false); resetPreview();
   setState('选择 .txt 文件后，这里会显示编码检测与压缩结果。');
@@ -224,6 +246,7 @@ document.getElementById('file').addEventListener('change',function(){
   setState('正在检测编码并压缩…');
   var reader=new FileReader();
   reader.onload=function(e){
+    if(sequence!==fileSequence) return;
     var enc=detect(e.target.result);
     var srcSize=f.size;
     var utf8=toUtf8Bytes(e.target.result,enc);
@@ -242,7 +265,7 @@ document.getElementById('file').addEventListener('change',function(){
     showEnc('<span class="ok">✓ '+esc(encName)+'</span> → 已压缩为 .zdx（'+
       fmtSize(zdx.length)+'，原 '+fmtSize(srcSize)+' 的 '+pct+'%）');
     setState('<span class="ok">✓ 已自动转码并压缩。</span> 原文件 '+fmtSize(srcSize)+
-      ' → 上传 '+fmtSize(zdx.length)+'（'+(pct>=0?'':'')+pct+'%，越小越省空间）。');
+      ' → 上传 '+fmtSize(zdx.length)+'（'+pct+'%，越小越省空间）。');
     previewBtn.style.display=gConvertedText?'inline-block':'none';
     if(enc==='gbk') highlightGuide(true,false);
     if(zdx.length>ZDX_MAX){
@@ -252,7 +275,9 @@ document.getElementById('file').addEventListener('change',function(){
       pendingBlob=null; resetPreview();
     }
   };
-  reader.onerror=function(){ showEnc('<span class="warn">文件读取失败，请重试。</span>');
+  reader.onerror=function(){
+    if(sequence!==fileSequence) return;
+    showEnc('<span class="warn">文件读取失败，请重试。</span>');
     setState('<span class="warn">文件读取失败，请重试。</span>'); };
   reader.readAsArrayBuffer(f);
 });
@@ -261,15 +286,16 @@ document.getElementById('form').addEventListener('submit',function(e){
   e.preventDefault();
   var f=document.getElementById('file').files[0];
   var msg=document.getElementById('msg'), btn=document.getElementById('submit');
+  if(btn.disabled) return;
   if(!f){msg.textContent='请先选择文件';return;}
   if(!pendingBlob){msg.textContent='编码与压缩尚未完成，请稍候或重新选择文件';return;}
   if(pendingBlob.size>ZDX_MAX){msg.textContent='压缩后文件过大，上限 512 KB';return;}
-  btn.disabled=true;msg.textContent='正在上传《'+esc(f.name)+'》…';
+  btn.disabled=true;msg.textContent='正在上传《'+f.name+'》…';
   fetch('/upload?name='+encodeURIComponent(f.name),{method:'POST',body:pendingBlob})
     .then(function(r){return r.json();}).then(function(d){
-      msg.textContent=d.ok?('已保存 '+esc(d.name)+'（占用 '+fmtSize(d.size)+'）'+
+      msg.textContent=d.ok?('已保存 '+d.name+'（占用 '+fmtSize(d.size)+'）'+
         (d.unsupported?('，其中 '+d.unsupported+' 个生僻字可能显示为方框'):'，字符全部受支持'))
-        :('上传失败：'+esc(d.error||'未知错误'));
+        :('上传失败：'+(d.error||'未知错误'));
       btn.disabled=false;refresh();
     }).catch(function(err){msg.textContent='上传出错：'+err;btn.disabled=false;refresh();});
 });

@@ -16,8 +16,12 @@ idf_component_register(
     INCLUDE_DIRS "."
     EMBED_TXTFILES "${CMAKE_CURRENT_LIST_DIR}/../assets/web/transfer.html"
     REQUIRES bsp nvs_flash esp_wifi esp_netif esp_event esp_http_server
-             spiffs esp_timer lwip uzlib
+             spiffs esp_partition esp_timer lwip uzlib
 )
+
+# Leave room in the HTTP task's 6 KiB stack for request dispatch and storage I/O.
+set_source_files_properties(reader_transfer.c PROPERTIES
+    COMPILE_OPTIONS "-Werror=frame-larger-than=2048")
 
 # Generated Chinese bitmap fonts live in assets/ and are compiled into flash.
 # One file per selectable body size (12..20 px); reader_layout.h owns the list.

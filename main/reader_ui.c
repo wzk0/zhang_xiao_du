@@ -101,6 +101,7 @@ static lv_obj_t *s_battery;
 static lv_obj_t *s_t_free;
 static lv_obj_t *s_t_bar;
 static lv_obj_t *s_t_status;
+static lv_obj_t *s_t_detail;
 static lv_obj_t *s_t_conn;
 
 void reader_ui_init(void)
@@ -129,7 +130,7 @@ static lv_obj_t *new_screen(reader_screen_t screen)
     apply_palette();
     if (s_screen) lv_obj_delete(s_screen);
     s_battery = NULL;
-    s_t_free = s_t_bar = s_t_status = s_t_conn = NULL;
+    s_t_free = s_t_bar = s_t_status = s_t_detail = s_t_conn = NULL;
     s_current = screen;
 
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -712,6 +713,14 @@ void reader_ui_render_storage(size_t total, size_t used, size_t free_bytes,
     lv_obj_t *scr = new_screen(READER_SCREEN_STORAGE);
     header(scr, "存储空间", NULL, battery);
 
+    if (!total) {
+        (void)centered_label(scr, UI_X, 140, UI_W - 2 * UI_X,
+                             F_BODY, C_INK, "空间读取失败");
+        footer(scr, "长按确定", "返回");
+        show(scr);
+        return;
+    }
+
     char free_text[32], total_text[24], used_text[24];
     format_size(free_bytes, free_text, sizeof(free_text));
     format_size(total, total_text, sizeof(total_text));
@@ -822,38 +831,57 @@ void reader_ui_render_font_picker(int font_size, const char *battery)
 static void fill_transfer_labels(const reader_transfer_status_t *status,
                                  size_t total, size_t used, size_t free_bytes)
 {
-    char free_text[32], conn[64], state[160];
+    char free_text[32], conn[64], state[80];
     format_size(free_bytes, free_text, sizeof(free_text));
 
-    if (s_t_free) lv_label_set_text(s_t_free, free_text);
+    const char *space = total ? free_text : "空间读取失败";
+    if (strcmp(lv_label_get_text(s_t_free), space) != 0) {
+        lv_label_set_text(s_t_free, space);
+    }
     if (s_t_bar) {
         unsigned pct = total ? (unsigned)((uint64_t)used * 100u / total) : 0;
         if (pct > 100) pct = 100;
         lv_obj_set_size(s_t_bar, (int32_t)(204u * pct / 100u), 4);
     }
     if (s_t_conn) {
-        snprintf(conn, sizeof(conn), "%s · %u 台",
-                 status->client_ready ? "手机已就绪" : "等待连接",
-                 (unsigned)status->client_count);
-        lv_label_set_text(s_t_conn, conn);
+        if (!status->active) {
+            snprintf(conn, sizeof(conn), "%s", "热点启动失败");
+        } else {
+            snprintf(conn, sizeof(conn), "%s · %u 台",
+                     status->client_ready ? "手机已就绪" : "等待连接",
+                     (unsigned)status->client_count);
+        }
+        if (strcmp(lv_label_get_text(s_t_conn), conn) != 0) {
+            lv_label_set_text(s_t_conn, conn);
+        }
     }
-    // ONE status line instead of three stacked ones: a glyph warning matters
-    // most, then the last upload, then the hotspot's own message. Three lines
-    // plus two captions used to make this page read like a log, and pushed the
-    // whole block below the panel's vertical centre.
-    if (status->last_unsupported > 0) {
-        snprintf(state, sizeof(state), "提示：%u 个生僻字显示为方框",
-                 (unsigned)status->last_unsupported);
-    } else if (status->last_upload[0]) {
-        char sz[24];
-        format_size(status->last_upload_size, sz, sizeof(sz));
-        snprintf(state, sizeof(state), "最近：%s %s", status->last_upload, sz);
-    } else {
-        snprintf(state, sizeof(state), "%s",
-                 status->last_message[0] ? status->last_message
-                                         : "尚未收到书籍");
+    const char *result = "尚未收到书籍";
+    switch (status->upload) {
+    case READER_UPLOAD_RECEIVING:
+        result = "正在接收";
+        break;
+    case READER_UPLOAD_SAVED:
+        result = "上传成功";
+        if (status->unsupported) {
+            snprintf(state, sizeof(state), "%s · %u 个字缺字形", result,
+                     (unsigned)status->unsupported);
+            result = state;
+        }
+        break;
+    case READER_UPLOAD_FAILED:
+        result = "上传失败";
+        break;
+    case READER_UPLOAD_IDLE:
+        break;
     }
-    if (s_t_status) lv_label_set_text(s_t_status, state);
+    if (strcmp(lv_label_get_text(s_t_status), result) != 0) {
+        lv_obj_set_style_text_color(s_t_status,
+            status->upload == READER_UPLOAD_SAVED ? C_ACCENT : C_SUB, 0);
+        lv_label_set_text(s_t_status, result);
+    }
+    if (strcmp(lv_label_get_text(s_t_detail), status->upload_detail) != 0) {
+        lv_label_set_text(s_t_detail, status->upload_detail);
+    }
 }
 
 void reader_ui_render_transfer(const reader_transfer_status_t *status,
@@ -863,21 +891,17 @@ void reader_ui_render_transfer(const reader_transfer_status_t *status,
     lv_obj_t *scr = new_screen(READER_SCREEN_TRANSFER);
     header(scr, "接收新书", NULL, battery);
 
-    // One centred block, y=88..260. Its centre (174) matches the usable area
-    // between the header (54) and the key chips (288), and the top/bottom gaps
-    // are near equal. Two captions and one status line were dropped to get
-    // here; everything that remains is centred on the same 204 px column.
     const int w = UI_W - 2 * UI_X;
-    (void)centered_label(scr, UI_X, 88, w, F_BODY, C_INK, READER_AP_SSID);
-    (void)centered_label(scr, UI_X, 112, w, F_BODY, C_ACCENT, READER_AP_URL);
-    (void)centered_label(scr, UI_X, 150, w, F_SMALL, C_SUB, "剩余空间");
-    s_t_free = centered_label(scr, UI_X, 168, w, F_NUM, C_INK, "");
+    (void)centered_label(scr, UI_X, 80, w, F_BODY, C_INK, READER_AP_SSID);
+    (void)centered_label(scr, UI_X, 104, w, F_BODY, C_ACCENT, READER_AP_URL);
+    (void)centered_label(scr, UI_X, 139, w, F_SMALL, C_SUB, "剩余空间");
+    s_t_free = centered_label(scr, UI_X, 157, w, F_NUM, C_INK, "");
+    s_t_bar = bar(scr, UI_X, 191, w, 4, 0);
 
-    // The filled part is resized in place by fill_transfer_labels().
-    s_t_bar = bar(scr, UI_X, 202, 204, 4, 0);
-
-    s_t_conn = centered_label(scr, UI_X, 222, w, F_SMALL, C_SUB, "");
-    s_t_status = centered_label(scr, UI_X, 244, w, F_SMALL, C_SUB, "");
+    s_t_conn = centered_label(scr, UI_X, 208, w, F_SMALL, C_SUB, "");
+    s_t_status = centered_label(scr, UI_X, 232, w, F_SMALL, C_SUB, "");
+    s_t_detail = centered_label(scr, UI_X, 250, w, F_SMALL, C_INK, "");
+    lv_label_set_long_mode(s_t_detail, LV_LABEL_LONG_WRAP);
 
     fill_transfer_labels(status, total, used, free_bytes);
     footer(scr, "长按确定", "返回并关闭热点");

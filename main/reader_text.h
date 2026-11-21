@@ -46,6 +46,13 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
                     int cols_units, int max_lines,
                     char *out, size_t out_size, reader_page_t *page);
 
+// Apply the same pagination policy with a hard display-width limit. Printable
+// ASCII advances are in 1/16 px; other characters use one em conservatively.
+int reader_paginate_fit(const char *text, size_t text_len, size_t start,
+                        int cols_units, int max_lines, int font_px, int width_px,
+                        const uint16_t *ascii_advance,
+                        char *out, size_t out_size, reader_page_t *page);
+
 // Build a short, single-line label from the text at a bookmark offset.
 // Leading whitespace and line breaks are skipped; a hard line break ends the
 // excerpt; UTF-8 sequences are never split. `max_units` counts half-width

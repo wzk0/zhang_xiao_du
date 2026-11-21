@@ -1,8 +1,7 @@
 name: Release v* firmware
 
-# Pushing a v* tag builds the firmware with ESP-IDF 5.5.3, verifies the merged
-# image, and publishes a GitHub Release. build-firmware.yml deliberately skips
-# v* tags (see its tags filter) so a tag never creates two releases.
+# A v* tag runs the complete gate and publishes a release. Manual runs can
+# produce the same artifacts for testing a branch.
 on:
   push:
     tags:
@@ -23,17 +22,19 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          fetch-tags: true
+          persist-credentials: false
 
       - name: Restore ccache
         uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: .ccache
-          key: release-ccache-${{ github.ref_name }}-${{ github.sha }}
+          key: release-ccache-esp32c3-v5.5.3-${{ hashFiles('dependencies.lock', 'sdkconfig.defaults') }}-${{ github.sha }}
           restore-keys: |
-            release-ccache-${{ github.ref_name }}-
-            release-ccache-
+            release-ccache-esp32c3-v5.5.3-${{ hashFiles('dependencies.lock', 'sdkconfig.defaults') }}-
 
-      - name: Build and verify merged firmware (ESP-IDF 5.5.3 / esp32c3)
+      - name: Run the complete gate (ESP-IDF 5.5.3 / esp32c3)
         uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
         with:
           esp_idf_version: v5.5.3
@@ -41,7 +42,7 @@ jobs:
           extra_docker_args: >-
             -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
             -e IDF_CCACHE_ENABLE=1
-          command: ./tools/validate.sh --firmware
+          command: ./tools/validate.sh
 
       - name: Assemble release assets
         run: |
@@ -51,11 +52,28 @@ jobs:
           cp build/FoloToy-AI-Passport.bin release/
           cp build/bootloader/bootloader.bin release/bootloader.bin
           cp build/partition_table/partition-table.bin release/partition-table.bin
-          cp build/flash_args release/
+          sed -e 's#bootloader/bootloader\.bin#bootloader.bin#' \
+              -e 's#partition_table/partition-table\.bin#partition-table.bin#' \
+              build/flash_args > release/flash_args
           cp assets/web/transfer.html release/
-          zip -qr release/zhangxiaodu-source.zip . \
-            -x ".git/*" "build/*" "managed_components/*" ".ccache/*" \
-               "release/*" ".agents/*" "sdkconfig" "sdkconfig.old"
+          git archive --format=zip --output=release/zhangxiaodu-source.zip HEAD
+          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
+            git for-each-ref --format='%(contents:body)' -- "${GITHUB_REF}" > release/notes.md
+          else
+            touch release/notes.md
+          fi
+          cat >> release/notes.md <<'NOTES'
+
+          ## 烧录与构建
+
+          初次安装可将 8 MB ESP32-C3 的合并镜像 `FoloToy-AI-Passport-full.bin`
+          从 `0x0` 烧录。合并烧录可能重置设置及书库。已有设备升级时，先确认分区表兼容，
+          可只把应用镜像 `FoloToy-AI-Passport.bin` 写入 `0x10000`，保留数据分区。
+          同目录的分段镜像可用 `python -m esptool --chip esp32c3 write_flash @flash_args` 烧录。
+
+          `SHA256SUMS.txt` 提供校验值。`zhangxiaodu-source.zip` 是此标签的源码。
+          在 ESP-IDF 5.5.3 环境运行 `./tools/validate.sh` 可执行主机测试并构建、校验合并镜像。
+          NOTES
           (cd release && sha256sum \
             FoloToy-AI-Passport-full.bin FoloToy-AI-Passport.bin \
             bootloader.bin partition-table.bin flash_args transfer.html \
@@ -93,29 +111,7 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: "掌小读 ${{ github.ref_name }}"
           generate_release_notes: true
-          body: |
-            ## 掌小读 · 电子书阅读器
-
-            Flash `FoloToy-AI-Passport-full.bin` from offset `0x0`; it is the verified
-            merged image for the 8 MB ESP32-C3 board. The split images and
-            `flash_args` are included for `idf.py flash`, and `SHA256SUMS.txt`
-            carries the checksums.
-
-            **What's new / 更新内容**: see the release notes generated from the
-            merged pull requests above.
-
-            **How to build / 如何构建**: with ESP-IDF 5.5.3 activated, run
-            `./tools/validate.sh --firmware`. It builds the app, merges the
-            images at the offsets in `flash_args`, and verifies the 8 MB layout.
-            A plain `idf.py build` does not produce or verify the merged image.
-
-            **How to use / 如何使用**: open
-            `https://ai-passport.folotoy.cn/tools/web-flasher/`, connect the USB
-            cable, select the merged `.bin`, and write it from `0x0`. After boot,
-            long-press DOWN while reading to open settings; 接收新书 starts the
-            `Passport-Books` hotspot at `http://192.168.4.1` for uploading books.
-            `transfer.html` is attached for offline reference, and
-            `zhangxiaodu-source.zip` is the complete source tree.
+          body_path: release/notes.md
           files: |
             release/FoloToy-AI-Passport-full.bin
             release/FoloToy-AI-Passport.bin

@@ -1,6 +1,7 @@
 // reader_text.c — pure text engine. See reader_text.h for the contract.
 #include "reader_text.h"
 
+#include <stdbool.h>
 #include <string.h>
 
 static int in_range(uint32_t cp, uint32_t lo, uint32_t hi)
@@ -87,9 +88,10 @@ static int is_line_start_banned(uint32_t cp)
     return 0;
 }
 
-int reader_paginate(const char *text, size_t text_len, size_t start,
-                    int cols_units, int max_lines,
-                    char *out, size_t out_size, reader_page_t *page)
+int reader_paginate_fit(const char *text, size_t text_len, size_t start,
+                        int cols_units, int max_lines, int font_px, int width_px,
+                        const uint16_t *ascii_advance,
+                        char *out, size_t out_size, reader_page_t *page)
 {
     if (!text || !out || !page || out_size < 8 || cols_units < 4 || max_lines < 1 ||
         start > text_len) {
@@ -99,6 +101,7 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
     size_t pos = start;
     size_t used = 0;
     int line_units = 0;
+    int line_width = 0;
     int lines = 0;
     out[0] = '\0';
 
@@ -118,6 +121,7 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
             out[used++] = '\n';
             ++lines;
             line_units = 0;
+            line_width = 0;
             pos += consumed;
             continue;
         }
@@ -129,10 +133,18 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
         int units = reader_is_wide(cp) ? 2 : 1;
         if (cp == '\t') units = 2;
 
-        if (line_units + units > cols_units && !is_line_start_banned(cp)) {
+        uint32_t drawn = (cp == '\t' || cp == READER_INVALID_CP) ? '?' : cp;
+        int advance = font_px;
+        if (ascii_advance && drawn >= 32 && drawn <= 126) {
+            advance = (ascii_advance[drawn - 32] + 8) / 16;
+        }
+        bool width_exceeded = width_px > 0 && line_width + advance > width_px;
+        if (line_units > 0 && (width_exceeded ||
+            (line_units + units > cols_units && !is_line_start_banned(cp)))) {
             out[used++] = '\n';
             ++lines;
             line_units = 0;
+            line_width = 0;
             if (lines >= max_lines) break;  // leave this character for next page
         }
 
@@ -143,6 +155,7 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
             used += consumed;
         }
         line_units += units;
+        line_width += advance;
         pos += consumed;
     }
 
@@ -166,6 +179,14 @@ int reader_paginate(const char *text, size_t text_len, size_t start,
     page->lines = lines;
     page->is_last = pos >= text_len;
     return 0;
+}
+
+int reader_paginate(const char *text, size_t text_len, size_t start,
+                    int cols_units, int max_lines,
+                    char *out, size_t out_size, reader_page_t *page)
+{
+    return reader_paginate_fit(text, text_len, start, cols_units, max_lines,
+                               0, 0, NULL, out, out_size, page);
 }
 
 int reader_excerpt(const char *text, size_t text_len, int max_units,

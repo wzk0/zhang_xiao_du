@@ -908,15 +908,15 @@ static void test_shelf_ui_contract(void)
     CHECK(reader_layout_immersive_lines(16) == 13);  // default font gains a line
     CHECK(reader_layout_immersive_lines(20) == 11);
 
-    // Transfer page: one centred block, two captions and one status line
-    // removed. No "total/used" detail widget, no separate upload row. The
-    // progress bar is now drawn by the shared bar() helper; y=202, a 204x4 px
-    // track and an empty initial fill still describe the same centred layout.
-    CHECK(strstr(src, "bar(scr, UI_X, 202, 204, 4, 0)") != NULL);
+    // The transfer page shares the centered column and bar style. The result
+    // and the uploaded title need both be visible, including on glyph warnings.
+    CHECK(strstr(src, "bar(scr, UI_X, 191, w, 4, 0)") != NULL);
     CHECK(strstr(src, "热点名称") == NULL);
     CHECK(strstr(src, "剩余存储空间") == NULL);
-    CHECK(strstr(src, "s_t_detail") == NULL);
-    CHECK(strstr(src, "s_t_upload") == NULL);
+    CHECK(strstr(src, "result = \"上传成功\"") != NULL);
+    CHECK(strstr(src, "result = \"上传失败\"") != NULL);
+    CHECK(strstr(src, "lv_label_set_text(s_t_detail, status->upload_detail)") != NULL);
+    CHECK(strstr(src, "lv_label_set_long_mode(s_t_detail, LV_LABEL_LONG_WRAP)") != NULL);
     CHECK(strstr(src, "台设备") == NULL);
 
     // End-of-book and delete-confirm pages re-centred in the usable band.

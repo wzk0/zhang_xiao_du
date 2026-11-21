@@ -16,6 +16,7 @@
 #include "reader_storage.h"
 #include "reader_store.h"
 #include "reader_text.h"
+#include "../assets/fonts/reader_ascii_advance.h"
 #include "reader_transfer.h"
 #include "reader_ui.h"
 
@@ -169,11 +170,6 @@ static int history_pop(uint32_t *offset)
 
 // Page geometry comes straight from reader_layout.c, the same table the font
 // picker previews with, so a preview can never disagree with the real page.
-static int page_cols(void)
-{
-    return reader_layout_cols(s_state.font_size);
-}
-
 static int page_lines(void)
 {
     // Immersive mode spends the chrome's vertical space on more lines. Every
@@ -187,6 +183,15 @@ static int page_lines(void)
 
 // Prepare the current page text and the next absolute offset. Pure data work:
 // no LVGL access, safe to call from the input task.
+static int paginate(const char *text, size_t len, size_t start,
+                    char *out, size_t out_size, reader_page_t *page)
+{
+    int font = reader_layout_font_index(s_state.font_size);
+    return reader_paginate_fit(text, len, start, reader_layout_cols(s_state.font_size),
+                               page_lines(), s_state.font_size, READER_LAYOUT_BODY_W,
+                               reader_ascii_advance[font], out, out_size, page);
+}
+
 static void prepare_page(void)
 {
     char window[PAGE_WINDOW_SIZE];
@@ -198,7 +203,7 @@ static void prepare_page(void)
         return;
     }
     reader_page_t page;
-    if (reader_paginate(window, (size_t)n, 0, page_cols(), page_lines(),
+    if (paginate(window, (size_t)n, 0,
                         s_state.page_text, sizeof(s_state.page_text),
                         &page) != 0) {
         s_state.page_text[0] = '\0';
@@ -404,7 +409,7 @@ static void rebuild_history(uint32_t from, uint32_t to)
         int n = reader_store_read(s_state.current_id, cur, text, sizeof(text));
         if (n <= 0) break;
         reader_page_t page;
-        if (reader_paginate(text, (size_t)n, 0, page_cols(), page_lines(),
+        if (paginate(text, (size_t)n, 0,
                             out, sizeof(out), &page) != 0) break;
         if (page.next == 0) break;
         uint32_t next = cur + (uint32_t)page.next;
@@ -438,7 +443,7 @@ static int prev_page_in_window(uint32_t *out)
         uint32_t rel = cur - base;
         if (rel >= (uint32_t)n) break;
         reader_page_t page;
-        if (reader_paginate(text, (size_t)n, rel, page_cols(), page_lines(),
+        if (paginate(text, (size_t)n, rel,
                             page_buf, sizeof(page_buf), &page) != 0) break;
         if (page.next == 0) break;
         uint32_t next = cur + (uint32_t)page.next;
@@ -481,7 +486,7 @@ static int prev_chapter_last_page(uint32_t *out)
         int n = reader_store_read(s_state.current_id, cur, text, sizeof(text));
         if (n <= 0) break;
         reader_page_t page;
-        if (reader_paginate(text, (size_t)n, 0, page_cols(), page_lines(),
+        if (paginate(text, (size_t)n, 0,
                             page_buf, sizeof(page_buf), &page) != 0) break;
         if (page.next == 0) break;
         uint32_t next = cur + (uint32_t)page.next;
@@ -789,7 +794,7 @@ static uint32_t page_start_at_or_before(uint32_t start, uint32_t target)
         int n = reader_store_read(s_state.current_id, cur, text, sizeof(text));
         if (n <= 0) break;
         reader_page_t page;
-        if (reader_paginate(text, (size_t)n, 0, page_cols(), page_lines(),
+        if (paginate(text, (size_t)n, 0,
                             out, sizeof(out), &page) != 0) break;
         if (page.next == 0) break;
         uint32_t next = cur + (uint32_t)page.next;

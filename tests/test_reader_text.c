@@ -79,6 +79,22 @@ static void test_pagination_ascii(void)
     CHECK(p.is_last == 1);
 }
 
+static void test_pixel_width_preserves_text(void)
+{
+    const char *text = "WWWWWWWWWWWWWWWW";
+    uint16_t advances[95] = {0};
+    advances['W' - 32] = 225; // The shipped 16 px glyph rounds to 14 px.
+    char out[64];
+    reader_page_t page;
+    CHECK(reader_paginate_fit(text, strlen(text), 0, 24, 1, 16, 204, advances,
+                              out, sizeof(out), &page) == 0);
+    CHECK(strcmp(out, "WWWWWWWWWWWWWW\n") == 0);
+    CHECK(page.next == 14 && !page.is_last);
+    CHECK(reader_paginate_fit(text, strlen(text), page.next, 24, 1, 16, 204, advances,
+                              out, sizeof(out), &page) == 0);
+    CHECK(strcmp(out, "WW") == 0 && page.is_last);
+}
+
 static void test_pagination_cjk(void)
 {
     // 12 Chinese characters, 3 bytes each. 4 wide chars fit in 8 units.
@@ -232,6 +248,7 @@ int main(void)
     test_utf8();
     test_width();
     test_pagination_ascii();
+    test_pixel_width_preserves_text();
     test_pagination_cjk();
     test_pagination_no_utf8_split();
     test_pagination_newlines_and_buffer();

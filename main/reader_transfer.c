@@ -13,8 +13,8 @@
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "reader_store.h"
+#include "reader_text.h"
 
-#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -42,18 +42,14 @@ static void status_lock_init(void)
     if (!s_status_lock) s_status_lock = xSemaphoreCreateMutex();
 }
 
-static void set_message(const char *fmt, ...)
+static void set_upload_status(reader_upload_state_t state, const char *detail,
+                              uint32_t unsupported)
 {
-    if (!s_status_lock) return;
-    char line[sizeof(s_status.last_message)];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    if (xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
-        snprintf(s_status.last_message, sizeof(s_status.last_message), "%s", line);
-        xSemaphoreGive(s_status_lock);
-    }
+    xSemaphoreTake(s_status_lock, portMAX_DELAY);
+    s_status.upload = state;
+    s_status.unsupported = unsupported;
+    snprintf(s_status.upload_detail, sizeof(s_status.upload_detail), "%s", detail);
+    xSemaphoreGive(s_status_lock);
 }
 
 void reader_transfer_get_status(reader_transfer_status_t *out)
@@ -161,21 +157,26 @@ static void dns_stop(void)
 // ---------------------------------------------------------------------------
 // HTTP helpers
 // ---------------------------------------------------------------------------
-static void url_decode(const char *src, char *dst, size_t dst_size)
+static bool url_decode(const char *src, char *dst, size_t dst_size)
 {
     size_t o = 0;
-    for (const char *p = src; *p && o + 1 < dst_size; ++p) {
+    for (const char *p = src; *p; ++p) {
+        if (o + 1 >= dst_size) return false;
         if (*p == '+') {
             dst[o++] = ' ';
         } else if (*p == '%' && p[1] && p[2]) {
             char hex[3] = { p[1], p[2], 0 };
-            dst[o++] = (char)strtol(hex, NULL, 16);
+            char *end;
+            long value = strtol(hex, &end, 16);
+            if (end != hex + 2 || value <= 0 || value > 255) return false;
+            dst[o++] = (char)value;
             p += 2;
         } else {
             dst[o++] = *p;
         }
     }
     dst[o] = '\0';
+    return true;
 }
 
 static int query_value(httpd_req_t *req, const char *key, char *out, size_t out_size)
@@ -188,12 +189,18 @@ static int query_value(httpd_req_t *req, const char *key, char *out, size_t out_
         free(query);
         return -1;
     }
-    char raw[192];
-    esp_err_t err = httpd_query_key_value(query, key, raw, sizeof(raw));
+    char *raw = malloc(qlen);
+    if (!raw) {
+        free(query);
+        return -1;
+    }
+    esp_err_t err = httpd_query_key_value(query, key, raw, qlen);
     free(query);
-    if (err != ESP_OK) return -1;
-    url_decode(raw, out, out_size);
-    return 0;
+    if (err == ESP_OK) {
+        err = url_decode(raw, out, out_size) ? ESP_OK : ESP_ERR_INVALID_SIZE;
+    }
+    free(raw);
+    return err == ESP_OK ? 0 : -1;
 }
 
 static size_t json_escape(const char *in, char *out, size_t out_size)
@@ -237,78 +244,101 @@ static esp_err_t handle_redirect(httpd_req_t *req)
     return httpd_resp_send(req, "", 0);
 }
 
-static int count_uploaded(void)
-{
-    reader_book_info_t books[READER_MAX_BOOKS];
-    int n = reader_store_list(books, READER_MAX_BOOKS);
-    int count = 0;
-    for (int i = 0; i < n; ++i) {
-        if (!books[i].builtin) ++count;
-    }
-    return count;
-}
-
 static esp_err_t handle_space(httpd_req_t *req)
 {
     size_t total = 0, used = 0, free_b = 0;
     if (reader_store_space(&total, &used, &free_b) != ESP_OK) {
-        total = used = free_b = 0;
+        return httpd_resp_send_500(req);
     }
     char body[160];
     snprintf(body, sizeof(body),
-             "{\"total\":%u,\"used\":%u,\"free\":%u,\"files\":%d}",
-             (unsigned)total, (unsigned)used, (unsigned)free_b, count_uploaded());
+             "{\"total\":%u,\"used\":%u,\"free\":%u}",
+             (unsigned)total, (unsigned)used, (unsigned)free_b);
     return send_json(req, 200, body);
 }
 
 static esp_err_t handle_list(httpd_req_t *req)
 {
-    reader_book_info_t books[READER_MAX_BOOKS];
+    // The HTTP task has a 6 KiB stack. Keep the shelf snapshot on the
+    // heap and send one JSON entry at a time.
+    reader_book_info_t *books = malloc(READER_MAX_BOOKS * sizeof(*books));
+    if (!books) return httpd_resp_send_500(req);
     int n = reader_store_list(books, READER_MAX_BOOKS);
-    char body[4096];
-    size_t used = 0;
-    used += (size_t)snprintf(body + used, sizeof(body) - used, "[");
-    for (int i = 0; i < n && used + 256 < sizeof(body); ++i) {
+    httpd_resp_set_type(req, "application/json; charset=utf-8");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    esp_err_t err = httpd_resp_send_chunk(req, "[", 1);
+    bool first = true;
+    for (int i = 0; i < n && err == ESP_OK; ++i) {
         if (books[i].builtin) continue;
-        char name[READER_BOOK_ID_MAX * 3];
+        char name[READER_BOOK_TITLE_MAX * 6 + 1];
+        char id[READER_BOOK_ID_MAX * 6 + 1];
+        char entry[sizeof(name) + sizeof(id) + 48];
         json_escape(books[i].title, name, sizeof(name));
-        used += (size_t)snprintf(body + used, sizeof(body) - used,
-                                 "%s{\"name\":\"%s\",\"size\":%u}",
-                                 used > 1 ? "," : "", name, (unsigned)books[i].size);
+        json_escape(books[i].id, id, sizeof(id));
+        snprintf(entry, sizeof(entry), "%s{\"id\":\"%s\",\"name\":\"%s\",\"size\":%u}",
+                 first ? "" : ",", id, name, (unsigned)books[i].size);
+        err = httpd_resp_sendstr_chunk(req, entry);
+        first = false;
     }
-    if (used + 2 < sizeof(body)) body[used++] = ']';
-    body[used] = '\0';
-    return send_json(req, 200, body);
+    free(books);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, "]", 1);
+    if (err == ESP_OK) err = httpd_resp_send_chunk(req, NULL, 0);
+    return err;
 }
 
 static esp_err_t handle_delete(httpd_req_t *req)
 {
-    char name[READER_BOOK_ID_MAX];
-    if (query_value(req, "name", name, sizeof(name)) == 0) {
-        (void)reader_store_delete(name);
+    char id[READER_BOOK_ID_MAX];
+    if (query_value(req, "id", id, sizeof(id)) != 0 || strncmp(id, "builtin:", 8) == 0) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"书籍编号无效\"}");
     }
-    return handle_redirect(req);
+    if (reader_store_delete_book(id) != ESP_OK) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"删除失败\"}");
+    }
+    return send_json(req, 200, "{\"ok\":true}");
+}
+
+static esp_err_t upload_error(httpd_req_t *req, const char *detail, const char *body)
+{
+    set_upload_status(READER_UPLOAD_FAILED, detail, 0);
+    return send_json(req, 400, body);
 }
 
 static esp_err_t handle_upload(httpd_req_t *req)
 {
     if (req->content_len == 0 || req->content_len > READER_MAX_UPLOAD_BYTES) {
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"zdx 文件大小必须在 1 B 到 512 KB 之间\"}");
+        return upload_error(req, "文件大小超限",
+                            "{\"ok\":false,\"error\":\"zdx 文件大小必须在 1 B 到 512 KB 之间\"}");
     }
     size_t total = 0, used = 0, free_b = 0;
     if (reader_store_space(&total, &used, &free_b) == ESP_OK &&
         free_b < req->content_len + 8192) {
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"剩余空间不足，请先删除部分书籍\"}");
+        return upload_error(req, "剩余空间不足",
+                            "{\"ok\":false,\"error\":\"剩余空间不足，请先删除部分书籍\"}");
     }
 
-    char name[192];
+    char name[256];
     if (query_value(req, "name", name, sizeof(name)) != 0 || name[0] == '\0') {
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"缺少文件名\"}");
+        return upload_error(req, "缺少文件名", "{\"ok\":false,\"error\":\"缺少文件名\"}");
     }
     char id[READER_BOOK_ID_MAX];
-    if (reader_store_begin_upload(name, id, sizeof(id)) != ESP_OK) {
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"已有上传任务或存储不可用\"}");
+    esp_err_t start = reader_store_begin_upload(name, id, sizeof(id));
+    if (start == ESP_ERR_INVALID_SIZE) {
+        return upload_error(req, "书架已满",
+                            "{\"ok\":false,\"error\":\"书架已满，请先删除部分书籍\"}");
     }
+    if (start != ESP_OK) {
+        return upload_error(req, "存储不可用",
+                            "{\"ok\":false,\"error\":\"已有上传任务或存储不可用\"}");
+    }
+
+    char title[READER_BOOK_ID_MAX];
+    // Storage normalises every accepted ID to a .zdx filename.
+    size_t title_len = strlen(id) - sizeof(".zdx") + 1;
+    if (reader_excerpt(id, title_len, 32, title, sizeof(title)) <= 0) {
+        snprintf(title, sizeof(title), "%s", "未命名");
+    }
+    set_upload_status(READER_UPLOAD_RECEIVING, title, 0);
 
     char buf[1024];
     size_t remaining = req->content_len;
@@ -330,14 +360,13 @@ static esp_err_t handle_upload(httpd_req_t *req)
     }
     if (!ok) {
         reader_store_abort_upload();
-        set_message("上传中断，已丢弃未完成的文件");
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"传输中断或写入失败\"}");
+        return upload_error(req, "传输中断或写入失败",
+                            "{\"ok\":false,\"error\":\"传输中断或写入失败\"}");
     }
 
     uint32_t unsupported = 0;
     if (reader_store_finish_upload(id, &unsupported) != ESP_OK) {
-        set_message("保存失败，请检查剩余空间");
-        return send_json(req, 400, "{\"ok\":false,\"error\":\"保存失败\"}");
+        return upload_error(req, "保存失败", "{\"ok\":false,\"error\":\"保存失败\"}");
     }
 
     char escaped[READER_BOOK_ID_MAX * 3];
@@ -347,14 +376,7 @@ static esp_err_t handle_upload(httpd_req_t *req)
              "{\"ok\":true,\"name\":\"%s\",\"size\":%u,\"unsupported\":%u}",
              escaped, (unsigned)received, (unsigned)unsupported);
 
-    if (s_status_lock && xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(200)) == pdTRUE) {
-        snprintf(s_status.last_upload, sizeof(s_status.last_upload), "%s", id);
-        s_status.last_upload_size = (uint32_t)received;
-        s_status.last_unsupported = unsupported;
-        s_status.total_uploads++;
-        xSemaphoreGive(s_status_lock);
-    }
-    set_message("已收到《%s》，共 %u 字节", id, (unsigned)received);
+    set_upload_status(READER_UPLOAD_SAVED, title, unsupported);
     ESP_LOGI(TAG, "上传完成 %s (%u B, 未覆盖字符 %u)", id, (unsigned)received,
              (unsigned)unsupported);
     return send_json(req, 200, body);
@@ -364,7 +386,7 @@ static const httpd_uri_t URI_HANDLERS[] = {
     { .uri = "/",       .method = HTTP_GET,  .handler = handle_root,     .user_ctx = NULL },
     { .uri = "/space",  .method = HTTP_GET,  .handler = handle_space,    .user_ctx = NULL },
     { .uri = "/list",   .method = HTTP_GET,  .handler = handle_list,     .user_ctx = NULL },
-    { .uri = "/delete", .method = HTTP_GET,  .handler = handle_delete,   .user_ctx = NULL },
+    { .uri = "/delete", .method = HTTP_POST,  .handler = handle_delete,   .user_ctx = NULL },
     { .uri = "/upload", .method = HTTP_POST, .handler = handle_upload,   .user_ctx = NULL },
     { .uri = "/*",      .method = HTTP_GET,  .handler = handle_redirect, .user_ctx = NULL },
 };
@@ -406,7 +428,6 @@ static void wifi_events(void *arg, esp_event_base_t base, int32_t id, void *data
             s_status.client_count++;
             xSemaphoreGive(s_status_lock);
         }
-        set_message("手机已连接，正在分配地址");
         ESP_LOGI(TAG, "设备已接入热点");
     } else if (base == WIFI_EVENT && id == WIFI_EVENT_AP_STADISCONNECTED) {
         if (s_status_lock && xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
@@ -414,13 +435,11 @@ static void wifi_events(void *arg, esp_event_base_t base, int32_t id, void *data
             s_status.client_ready = false;
             xSemaphoreGive(s_status_lock);
         }
-        set_message("手机已断开，热点仍在运行");
     } else if (base == IP_EVENT && id == IP_EVENT_AP_STAIPASSIGNED) {
         if (s_status_lock && xSemaphoreTake(s_status_lock, pdMS_TO_TICKS(100)) == pdTRUE) {
             s_status.client_ready = true;
             xSemaphoreGive(s_status_lock);
         }
-        set_message("手机已就绪，可打开传书页面");
         ESP_LOGI(TAG, "DHCP 已分配地址，免费堆 %u B", (unsigned)esp_get_free_heap_size());
     }
 }
@@ -458,6 +477,7 @@ static void rollback(void)
 esp_err_t reader_transfer_start(void)
 {
     status_lock_init();
+    if (!s_status_lock) return ESP_ERR_NO_MEM;
     if (s_status.active) return ESP_OK;
 
     ESP_LOGI(TAG, "启动热点前免费堆 %u B", (unsigned)esp_get_free_heap_size());
@@ -510,7 +530,6 @@ esp_err_t reader_transfer_start(void)
     if (err != ESP_OK) goto fail;
 
     s_status.active = true;
-    set_message("热点已开启，等待手机连接");
     ESP_LOGI(TAG, "热点 %s 已开启，页面 %s，免费堆 %u B",
              READER_AP_SSID, READER_AP_URL, (unsigned)esp_get_free_heap_size());
     return ESP_OK;
