@@ -23,7 +23,7 @@ typedef struct {
 typedef struct {
     uint32_t total;        // non-ASCII, non-control code points examined
     uint32_t unsupported;  // code points outside the declared font inventory
-    uint32_t sample[8];    // first unsupported code points, for the UI hint
+    uint32_t sample[8];    // first distinct unsupported code points, for the UI hint
     uint32_t sample_count;
 } reader_charset_report_t;
 
@@ -66,6 +66,10 @@ int reader_excerpt(const char *text, size_t text_len, int max_units,
 // 1 when a line looks like a chapter heading. Used by the streaming index
 // builder in reader_store.c. `len` is the line length without the newline.
 int reader_chapter_match(const char *line, size_t len);
+
+// Accumulate block results while keeping only distinct example code points.
+void reader_charset_report_merge(reader_charset_report_t *total,
+                                  const reader_charset_report_t *chunk);
 
 // Count code points outside the declared font inventory. `is_supported` is
 // supplied by the application (it consults the generated font), keeping this

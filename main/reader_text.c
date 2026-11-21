@@ -287,6 +287,26 @@ int reader_chapter_match(const char *line, size_t len)
     return 0;
 }
 
+static void append_missing_sample(reader_charset_report_t *report, uint32_t cp)
+{
+    for (uint32_t i = 0; i < report->sample_count; ++i) {
+        if (report->sample[i] == cp) return;
+    }
+    if (report->sample_count < sizeof(report->sample) / sizeof(report->sample[0])) {
+        report->sample[report->sample_count++] = cp;
+    }
+}
+
+void reader_charset_report_merge(reader_charset_report_t *total,
+                                  const reader_charset_report_t *chunk)
+{
+    total->total += chunk->total;
+    total->unsupported += chunk->unsupported;
+    for (uint32_t i = 0; i < chunk->sample_count; ++i) {
+        append_missing_sample(total, chunk->sample[i]);
+    }
+}
+
 int reader_scan_charset(const char *text, size_t text_len,
                         int (*is_supported)(uint32_t cp, void *ctx), void *ctx,
                         reader_charset_report_t *report)
@@ -305,9 +325,7 @@ int reader_scan_charset(const char *text, size_t text_len,
         ++report->total;
         if (!is_supported(cp, ctx)) {
             ++report->unsupported;
-            if (report->sample_count < 8) {
-                report->sample[report->sample_count++] = cp;
-            }
+            append_missing_sample(report, cp);
         }
     }
     return 0;

@@ -55,7 +55,7 @@ def parse_bdf(text: str) -> dict[int, tuple[int, int, int, int, int, list[list[i
         rows: list[list[int]] = []
         i += 1
         while i < n and not lines[i].startswith("ENDCHAR"):
-            ln = lines[i]
+            ln = lines[i].strip()
             if ln.startswith("ENCODING "):
                 enc = int(ln.split()[1])
             elif ln.startswith("DWIDTH "):

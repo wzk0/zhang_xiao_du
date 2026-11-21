@@ -28,7 +28,8 @@ typedef struct {
 // be removed. The single sample novel may be deleted from the shelf;
 // reader_store.c remembers that choice in NVS as a bit mask, so the array must
 // stay within 8 entries (index 0 is the guide, bit 1 covers the novel).
-#define READER_BUILTIN_GUIDE_ID "builtin:guide"
+// The rewritten guide must open at its new cover; old byte offsets no longer match.
+#define READER_BUILTIN_GUIDE_ID "builtin:guide:v2"
 
 extern const reader_builtin_book_t g_builtin_books[];
 extern const int g_builtin_book_count;

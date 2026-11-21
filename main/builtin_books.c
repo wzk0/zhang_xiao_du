@@ -9,7 +9,7 @@
 #include "builtin_books_data.h"
 
 const reader_builtin_book_t g_builtin_books[] = {
-    { "builtin:guide", "掌小读使用指南", g_builtin_zdx_guide,
+    { READER_BUILTIN_GUIDE_ID, "掌小读使用指南", g_builtin_zdx_guide,
       sizeof(g_builtin_zdx_guide),
       READER_ZDX_GUIDE_ORIG_SIZE, READER_ZDX_GUIDE_TEXT_CHARS },
     { "builtin:ginga", "银河铁道之夜", g_builtin_zdx_ginga,

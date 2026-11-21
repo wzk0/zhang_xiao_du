@@ -94,6 +94,8 @@ void reader_ui_set_hint(const char *text)
 static lv_obj_t *s_screen;
 static reader_screen_t s_current = READER_SCREEN_LIBRARY;
 static lv_obj_t *s_battery;
+static lv_obj_t *s_load_status;
+static lv_obj_t *s_load_bar;
 
 // Transfer-page widgets, refreshed in place by the tick timer. Only the value
 // labels are retained: captions and the "total/used" detail were removed to
@@ -108,6 +110,7 @@ void reader_ui_init(void)
 {
     s_screen = NULL;
     s_battery = NULL;
+    s_load_status = s_load_bar = NULL;
     s_current = READER_SCREEN_LIBRARY;
     s_dark = false;
     apply_palette();
@@ -224,6 +227,31 @@ static lv_obj_t *bar(lv_obj_t *scr, int x, int y, int w, int h, int pct)
     lv_obj_set_style_bg_opa(fill, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(fill, h / 2, 0);
     return fill;
+}
+
+void reader_ui_update_loading(const char *title, const char *phase, unsigned percent)
+{
+    if (!s_screen) return;
+    const int panel_w = UI_W - 2 * UI_X;
+    const int content_w = panel_w - 24;
+    if (!s_load_status) {
+        lv_obj_t *shade = lv_obj_create(s_screen);
+        lv_obj_remove_style_all(shade);
+        lv_obj_set_size(shade, UI_W, UI_H);
+        lv_obj_set_style_bg_color(shade, C_INK, 0);
+        lv_obj_set_style_bg_opa(shade, LV_OPA_30, 0);
+        lv_obj_t *panel = row(shade, UI_X, 112, panel_w, 96, true);
+        lv_obj_set_style_bg_color(panel, C_PAPER, 0);
+        (void)centered_label(panel, 12, 12, content_w, F_BODY, C_INK, title);
+        s_load_status = centered_label(panel, 12, 43, content_w, F_SMALL, C_SUB, "");
+        s_load_bar = bar(panel, 12, 69, content_w, 4, 0);
+    }
+
+    if (percent > 100) percent = 100;
+    char text[48];
+    snprintf(text, sizeof(text), "%s · %u%%", phase, percent);
+    lv_label_set_text(s_load_status, text);
+    lv_obj_set_width(s_load_bar, (int32_t)((unsigned)content_w * percent / 100u));
 }
 
 static void header(lv_obj_t *scr, const char *title, const char *subtitle,
@@ -858,7 +886,15 @@ static void fill_transfer_labels(const reader_transfer_status_t *status,
     const char *result = "尚未收到书籍";
     switch (status->upload) {
     case READER_UPLOAD_RECEIVING:
-        result = "正在接收";
+        snprintf(state, sizeof(state), "正在接收 %u%%", (unsigned)status->upload_percent);
+        result = state;
+        break;
+    case READER_UPLOAD_PAUSED:
+        snprintf(state, sizeof(state), "等待续传 %u%%", (unsigned)status->upload_percent);
+        result = state;
+        break;
+    case READER_UPLOAD_VERIFYING:
+        result = "正在校验书籍";
         break;
     case READER_UPLOAD_SAVED:
         result = "上传成功";
@@ -904,7 +940,7 @@ void reader_ui_render_transfer(const reader_transfer_status_t *status,
     lv_label_set_long_mode(s_t_detail, LV_LABEL_LONG_WRAP);
 
     fill_transfer_labels(status, total, used, free_bytes);
-    footer(scr, "长按确定", "返回并关闭热点");
+    footer(scr, "长按确定关闭热点", NULL);
     show(scr);
 }
 

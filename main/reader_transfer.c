@@ -13,8 +13,10 @@
 #include "lwip/sockets.h"
 #include "esp_http_server.h"
 #include "reader_store.h"
+#include "reader_storage.h"
 #include "reader_text.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +49,7 @@ static void set_upload_status(reader_upload_state_t state, const char *detail,
 {
     xSemaphoreTake(s_status_lock, portMAX_DELAY);
     s_status.upload = state;
+    s_status.upload_percent = 0;
     s_status.unsupported = unsupported;
     snprintf(s_status.upload_detail, sizeof(s_status.upload_detail), "%s", detail);
     xSemaphoreGive(s_status_lock);
@@ -252,8 +255,9 @@ static esp_err_t handle_space(httpd_req_t *req)
     }
     char body[160];
     snprintf(body, sizeof(body),
-             "{\"total\":%u,\"used\":%u,\"free\":%u}",
-             (unsigned)total, (unsigned)used, (unsigned)free_b);
+             "{\"total\":%u,\"used\":%u,\"free\":%u,\"upload_max\":%u}",
+             (unsigned)total, (unsigned)used, (unsigned)free_b,
+             (unsigned)reader_storage_upload_budget(free_b));
     return send_json(req, 200, body);
 }
 
@@ -304,25 +308,115 @@ static esp_err_t upload_error(httpd_req_t *req, const char *detail, const char *
     return send_json(req, 400, body);
 }
 
-static esp_err_t handle_upload(httpd_req_t *req)
+// Only the HTTP server task owns this state. Teardown clears it after that
+// task stops, so a dropped TCP connection can leave the temporary file open.
+#define UPLOAD_CHUNK_BYTES (32u * 1024u)
+static struct {
+    char token[33];
+    char id[READER_BOOK_ID_MAX];
+    char title[READER_BOOK_ID_MAX];
+    size_t total;
+    size_t received;
+    reader_charset_report_t coverage;
+    bool saved;
+} s_upload;
+
+static void clear_upload(void)
 {
-    if (req->content_len == 0 || req->content_len > READER_MAX_UPLOAD_BYTES) {
-        return upload_error(req, "文件大小超限",
-                            "{\"ok\":false,\"error\":\"zdx 文件大小必须在 1 B 到 512 KB 之间\"}");
+    if (s_upload.token[0] && !s_upload.saved) reader_store_abort_upload();
+    memset(&s_upload, 0, sizeof(s_upload));
+}
+
+static bool read_upload_token(httpd_req_t *req, char *token)
+{
+    return query_value(req, "token", token, sizeof(s_upload.token)) == 0 &&
+           strlen(token) == sizeof(s_upload.token) - 1 &&
+           strspn(token, "0123456789abcdef") == sizeof(s_upload.token) - 1;
+}
+
+static bool read_upload_number(httpd_req_t *req, const char *key, size_t *number)
+{
+    char value[16], *end;
+    if (query_value(req, key, value, sizeof(value)) != 0 ||
+        value[0] < '0' || value[0] > '9') return false;
+    errno = 0;
+    unsigned long parsed = strtoul(value, &end, 10);
+    if (errno || *end) return false;
+    *number = (size_t)parsed;
+    return true;
+}
+
+static esp_err_t send_upload_offset(httpd_req_t *req)
+{
+    char body[384];
+    if (s_upload.saved) {
+        char escaped[READER_BOOK_ID_MAX * 3];
+        json_escape(s_upload.id, escaped, sizeof(escaped));
+        // IDs are bounded by the SPIFFS name limit and at most eight samples
+        // follow. Even with unsigned decimal code points they fit in body.
+        size_t used = (size_t)snprintf(body, sizeof(body),
+                 "{\"ok\":true,\"done\":true,\"offset\":%u,\"name\":\"%s\","
+                 "\"size\":%u,\"unsupported\":%u,\"missing\":[",
+                 (unsigned)s_upload.received, escaped, (unsigned)s_upload.received,
+                 (unsigned)s_upload.coverage.unsupported);
+        for (uint32_t i = 0; i < s_upload.coverage.sample_count; ++i) {
+            used += (size_t)snprintf(body + used, sizeof(body) - used, "%s%u",
+                      i ? "," : "", (unsigned)s_upload.coverage.sample[i]);
+        }
+        snprintf(body + used, sizeof(body) - used, "]}");
+    } else {
+        snprintf(body, sizeof(body), "{\"ok\":true,\"done\":false,\"offset\":%u}",
+                 (unsigned)s_upload.received);
     }
-    size_t total = 0, used = 0, free_b = 0;
-    if (reader_store_space(&total, &used, &free_b) == ESP_OK &&
-        free_b < req->content_len + 8192) {
+    return send_json(req, 200, body);
+}
+
+static esp_err_t handle_upload_status(httpd_req_t *req)
+{
+    char token[sizeof(s_upload.token)];
+    if (!read_upload_token(req, token) || strcmp(s_upload.token, token) != 0) {
+        return send_json(req, 200, "{\"ok\":true,\"restart\":true,\"done\":false,\"offset\":0}");
+    }
+    return send_upload_offset(req);
+}
+
+static esp_err_t start_upload(httpd_req_t *req)
+{
+    char token[sizeof(s_upload.token)];
+    size_t total;
+    char name[256];
+    if (!read_upload_token(req, token) || !read_upload_number(req, "total", &total) ||
+        total == 0 || req->content_len == 0 || req->content_len >= sizeof(name)) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"上传信息无效\"}");
+    }
+    if (strcmp(s_upload.token, token) == 0) {
+        if (total != s_upload.total) {
+            return send_json(req, 400, "{\"ok\":false,\"error\":\"上传信息无效\"}");
+        }
+        return send_upload_offset(req);
+    }
+    size_t received = 0;
+    while (received < req->content_len) {
+        int n = httpd_req_recv(req, name + received, req->content_len - received);
+        if (n <= 0) return ESP_FAIL;
+        received += (size_t)n;
+    }
+    if (memchr(name, '\0', received)) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"文件名无效\"}");
+    }
+    name[received] = '\0';
+
+    clear_upload();
+    size_t free_b = 0;
+    if (reader_store_space(NULL, NULL, &free_b) != ESP_OK) {
+        return upload_error(req, "空间读取失败",
+                            "{\"ok\":false,\"error\":\"书库空间读取失败\"}");
+    }
+    if (total > reader_storage_upload_budget(free_b)) {
         return upload_error(req, "剩余空间不足",
                             "{\"ok\":false,\"error\":\"剩余空间不足，请先删除部分书籍\"}");
     }
-
-    char name[256];
-    if (query_value(req, "name", name, sizeof(name)) != 0 || name[0] == '\0') {
-        return upload_error(req, "缺少文件名", "{\"ok\":false,\"error\":\"缺少文件名\"}");
-    }
-    char id[READER_BOOK_ID_MAX];
-    esp_err_t start = reader_store_begin_upload(name, id, sizeof(id));
+    esp_err_t start = reader_store_begin_upload(name, s_upload.id, sizeof(s_upload.id));
     if (start == ESP_ERR_INVALID_SIZE) {
         return upload_error(req, "书架已满",
                             "{\"ok\":false,\"error\":\"书架已满，请先删除部分书籍\"}");
@@ -331,55 +425,94 @@ static esp_err_t handle_upload(httpd_req_t *req)
         return upload_error(req, "存储不可用",
                             "{\"ok\":false,\"error\":\"已有上传任务或存储不可用\"}");
     }
-
-    char title[READER_BOOK_ID_MAX];
-    // Storage normalises every accepted ID to a .zdx filename.
-    size_t title_len = strlen(id) - sizeof(".zdx") + 1;
-    if (reader_excerpt(id, title_len, 32, title, sizeof(title)) <= 0) {
-        snprintf(title, sizeof(title), "%s", "未命名");
+    memcpy(s_upload.token, token, sizeof(s_upload.token));
+    s_upload.total = total;
+    size_t title_len = strlen(s_upload.id) - sizeof(".zdx") + 1;
+    if (reader_excerpt(s_upload.id, title_len, 32, s_upload.title, sizeof(s_upload.title)) <= 0) {
+        snprintf(s_upload.title, sizeof(s_upload.title), "%s", "未命名");
     }
-    set_upload_status(READER_UPLOAD_RECEIVING, title, 0);
+    set_upload_status(READER_UPLOAD_RECEIVING, s_upload.title, 0);
+    return send_upload_offset(req);
+}
 
+static void set_upload_progress(reader_upload_state_t state)
+{
+    uint8_t percent = (uint8_t)((uint64_t)s_upload.received * 100 / s_upload.total);
+    xSemaphoreTake(s_status_lock, portMAX_DELAY);
+    s_status.upload = state;
+    s_status.upload_percent = percent;
+    xSemaphoreGive(s_status_lock);
+}
+
+static esp_err_t finish_upload(httpd_req_t *req)
+{
+    set_upload_status(READER_UPLOAD_VERIFYING, s_upload.title, 0);
+    esp_err_t finish = reader_store_finish_upload(s_upload.id, &s_upload.coverage);
+    if (finish != ESP_OK) {
+        clear_upload();
+        if (finish == ESP_ERR_NO_MEM) {
+            return upload_error(req, "书库空间不足",
+                                "{\"ok\":false,\"error\":\"书库空间不足，请删除部分书籍\"}");
+        }
+        if (finish == ESP_ERR_INVALID_ARG) {
+            return upload_error(req, "书籍校验失败",
+                                "{\"ok\":false,\"error\":\"书籍校验失败，请重新选择文件\"}");
+        }
+        return upload_error(req, "保存失败", "{\"ok\":false,\"error\":\"保存失败\"}");
+    }
+    s_upload.saved = true;
+    set_upload_status(READER_UPLOAD_SAVED, s_upload.title, s_upload.coverage.unsupported);
+    return send_upload_offset(req);
+}
+
+static esp_err_t handle_upload(httpd_req_t *req)
+{
+    char token[sizeof(s_upload.token)];
+    size_t total, offset;
+    if (!read_upload_token(req, token) ||
+        !read_upload_number(req, "total", &total) ||
+        !read_upload_number(req, "offset", &offset) ||
+        total == 0 || offset > total || req->content_len > UPLOAD_CHUNK_BYTES ||
+        req->content_len > total - offset) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"上传信息无效\"}");
+    }
+
+    if (strcmp(s_upload.token, token) != 0) {
+        return send_json(req, 200, "{\"ok\":true,\"restart\":true,\"done\":false,\"offset\":0}");
+    }
+    if (total != s_upload.total) {
+        return send_json(req, 400, "{\"ok\":false,\"error\":\"上传信息无效\"}");
+    }
+    if (s_upload.saved || offset != s_upload.received || req->content_len == 0) {
+        return send_upload_offset(req);
+    }
+
+    set_upload_progress(READER_UPLOAD_RECEIVING);
     char buf[1024];
     size_t remaining = req->content_len;
-    size_t received = 0;
-    bool ok = true;
     while (remaining > 0) {
         size_t want = remaining < sizeof(buf) ? remaining : sizeof(buf);
         int r = httpd_req_recv(req, buf, want);
-        if (r <= 0) {  // timeout, disconnect or error
-            ok = false;
-            break;
+        if (r <= 0) {
+            set_upload_progress(READER_UPLOAD_PAUSED);
+            return ESP_FAIL;
         }
-        if (reader_store_write_chunk(buf, (size_t)r) != ESP_OK) {
-            ok = false;
-            break;
+        esp_err_t write_result = reader_store_write_chunk(buf, (size_t)r);
+        if (write_result != ESP_OK) {
+            clear_upload();
+            if (write_result == ESP_ERR_NO_MEM) {
+                return upload_error(req, "书库空间不足",
+                                    "{\"ok\":false,\"error\":\"书库空间不足，请删除部分书籍\"}");
+            }
+            return upload_error(req, "书库写入失败",
+                                "{\"ok\":false,\"error\":\"书库写入失败，请重试\"}");
         }
         remaining -= (size_t)r;
-        received += (size_t)r;
+        s_upload.received += (size_t)r;
     }
-    if (!ok) {
-        reader_store_abort_upload();
-        return upload_error(req, "传输中断或写入失败",
-                            "{\"ok\":false,\"error\":\"传输中断或写入失败\"}");
-    }
-
-    uint32_t unsupported = 0;
-    if (reader_store_finish_upload(id, &unsupported) != ESP_OK) {
-        return upload_error(req, "保存失败", "{\"ok\":false,\"error\":\"保存失败\"}");
-    }
-
-    char escaped[READER_BOOK_ID_MAX * 3];
-    json_escape(id, escaped, sizeof(escaped));
-    char body[256];
-    snprintf(body, sizeof(body),
-             "{\"ok\":true,\"name\":\"%s\",\"size\":%u,\"unsupported\":%u}",
-             escaped, (unsigned)received, (unsigned)unsupported);
-
-    set_upload_status(READER_UPLOAD_SAVED, title, unsupported);
-    ESP_LOGI(TAG, "上传完成 %s (%u B, 未覆盖字符 %u)", id, (unsigned)received,
-             (unsigned)unsupported);
-    return send_json(req, 200, body);
+    set_upload_progress(READER_UPLOAD_RECEIVING);
+    vTaskDelay(1);
+    return s_upload.received == s_upload.total ? finish_upload(req) : send_upload_offset(req);
 }
 
 static const httpd_uri_t URI_HANDLERS[] = {
@@ -387,6 +520,8 @@ static const httpd_uri_t URI_HANDLERS[] = {
     { .uri = "/space",  .method = HTTP_GET,  .handler = handle_space,    .user_ctx = NULL },
     { .uri = "/list",   .method = HTTP_GET,  .handler = handle_list,     .user_ctx = NULL },
     { .uri = "/delete", .method = HTTP_POST,  .handler = handle_delete,   .user_ctx = NULL },
+    { .uri = "/upload/start", .method = HTTP_POST, .handler = start_upload, .user_ctx = NULL },
+    { .uri = "/upload", .method = HTTP_GET,  .handler = handle_upload_status, .user_ctx = NULL },
     { .uri = "/upload", .method = HTTP_POST, .handler = handle_upload,   .user_ctx = NULL },
     { .uri = "/*",      .method = HTTP_GET,  .handler = handle_redirect, .user_ctx = NULL },
 };
@@ -398,7 +533,7 @@ static esp_err_t http_start(void)
     config.stack_size = 6144;      // see the SoftAP resource-budget reference
     config.max_uri_handlers = 10;
     config.backlog_conn = 2;
-    config.recv_wait_timeout = 5;
+    config.recv_wait_timeout = 15;
     config.send_wait_timeout = 5;
     config.lru_purge_enable = true;
     config.uri_match_fn = httpd_uri_match_wildcard;
@@ -450,6 +585,7 @@ static void rollback(void)
         httpd_stop(s_httpd);
         s_httpd = NULL;
     }
+    clear_upload();
     dns_stop();
     if (s_wifi_handler) {
         (void)esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, s_wifi_handler);

@@ -613,6 +613,31 @@ def check_charset_header(inventory: set[int]) -> None:
         raise RuntimeError(f"{CHARSET_HEADER.name}: READER_CHARSET_COUNT mismatch")
 
 
+def check_fallback_coverage() -> int:
+    text = (FONT_DIR / "reader_fallback_data.h").read_text(encoding="utf-8")
+    match = re.search(r"fallback_codepoints\[\] = \{(.*?)\};", text, re.S)
+    if not match:
+        raise RuntimeError("missing fallback code point array")
+    actual = [int(value, 16) for value in re.findall(r"0x([0-9A-F]{4})", match.group(1))]
+    expected = []
+    for first in range(0xD8, 0xF8):
+        for second in range(0xA1, 0xFF):
+            try:
+                expected.append(ord(bytes((first, second)).decode("gb2312")))
+            except UnicodeDecodeError:
+                continue
+    if actual != sorted(expected) or len(actual) != 3008:
+        raise RuntimeError("fallback does not cover exactly GB2312 level 2")
+    rows = re.findall(r"\{((?:0x[0-9A-F]{4},? ?)+)\}, // U\+([0-9A-F]{4})", text)
+    if [int(cp, 16) for _, cp in rows] != actual:
+        raise RuntimeError("fallback glyph order differs from its lookup table")
+    for bitmap, cp in rows:
+        values = [int(value, 16) for value in re.findall(r"0x([0-9A-F]{4})", bitmap)]
+        if len(values) != 16 or not any(values):
+            raise RuntimeError(f"fallback U+{cp}: invalid 16 px strike")
+    return len(actual)
+
+
 def main() -> int:
     errors: list[str] = []
     try:
@@ -673,13 +698,20 @@ def main() -> int:
     except RuntimeError as exc:
         errors.append(str(exc))
 
+    fallback_count = 0
+    try:
+        fallback_count = check_fallback_coverage()
+    except RuntimeError as exc:
+        errors.append(str(exc))
+
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
         print("Regenerate fonts with: python3 tools/gen_reader_font.py", file=sys.stderr)
         return 1
     print(f"reader_font_coverage: PASS ({len(inventory)} code points, "
-          f"{len(fonts)} crisp 1bpp font files, {sizes[0]}..{sizes[-1]} px)")
+          f"{len(fonts)} crisp 1bpp fonts, {sizes[0]}..{sizes[-1]} px; "
+          f"{fallback_count} fallback glyphs)")
     return 0
 
 

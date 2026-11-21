@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 #include "reader_bookmark.h"
+#include "reader_text.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -19,6 +20,7 @@
 #define READER_MAX_CHAPTERS     64
 #define READER_CHAPTER_TITLE_MAX 40
 #define READER_UPLOAD_TMP_NAME  ".upload.tmp"
+#define READER_PAGE_HISTORY_MAX 64
 
 typedef struct {
     char id[READER_BOOK_ID_MAX];
@@ -58,12 +60,20 @@ int reader_store_read(const char *id, size_t offset, char *buf, size_t len);
 
 // Scan a whole book (streaming) for chapter headings and, in the same pass,
 // count its non-whitespace UTF-8 code points into out->char_count.
-esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out);
+typedef void (*reader_index_progress_fn)(size_t done, size_t total, void *ctx);
+esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out,
+                                   reader_index_progress_fn progress, void *ctx);
+
+// Best-effort cache for the exact paginated history at a saved byte offset.
+int reader_store_history_load(const char *id, uint32_t offset, uint32_t layout,
+                              uint32_t history[READER_PAGE_HISTORY_MAX]);
+void reader_store_history_save(const char *id, uint32_t offset, uint32_t layout,
+                               const uint32_t *history, int count);
 
 // Upload lifecycle. Only one upload may be in flight at a time.
 esp_err_t reader_store_begin_upload(const char *name, char *out_id, size_t out_id_size);
 esp_err_t reader_store_write_chunk(const char *data, size_t len);
-esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out);
+esp_err_t reader_store_finish_upload(const char *id, reader_charset_report_t *coverage_out);
 void reader_store_abort_upload(void);
 esp_err_t reader_store_delete(const char *id);
 

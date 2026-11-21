@@ -27,6 +27,17 @@ static void test_percent(void)
     CHECK(reader_storage_percent(1024u * 1024u, 4u * 1024u * 1024u) == 25);
 }
 
+static void test_upload_budget(void)
+{
+    const size_t kib = 1024u;
+    CHECK(reader_storage_upload_budget(0) == 0);
+    CHECK(reader_storage_upload_budget(8 * kib) == 0);
+    CHECK(reader_storage_upload_budget(64 * kib) == 55 * kib);
+    CHECK(reader_storage_upload_budget(2 * 1024 * kib) == 2008 * kib);
+    CHECK(reader_storage_upload_budget(2 * 1024 * kib) > 512 * kib);
+    CHECK(reader_storage_upload_budget((size_t)-1) < (size_t)-1);
+}
+
 static void test_hint_bounds(void)
 {
     char out[128];
@@ -91,6 +102,7 @@ static void test_hint_is_complete_utf8(void)
 int main(void)
 {
     test_percent();
+    test_upload_budget();
     test_hint_bounds();
     test_hint_scales();
     test_hint_is_complete_utf8();

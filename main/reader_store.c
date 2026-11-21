@@ -14,6 +14,7 @@
 #include "esp_spiffs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "nvs.h"
 #include "sys/stat.h"
 #include <errno.h>
@@ -134,6 +135,84 @@ static bool valid_uploaded_id(const char *id)
     return len > sizeof(BOOK_EXT) - 1 && len <= BOOK_ID_LIMIT &&
            !strchr(id, '/') && !strchr(id, '\\') &&
            strcmp(id + len - (sizeof(BOOK_EXT) - 1), BOOK_EXT) == 0;
+}
+
+// Hidden files are disposable. The full ID in the header prevents a filename
+// hash collision from loading another book's cache.
+typedef struct {
+    uint32_t version;
+    uint32_t key1;
+    uint32_t key2;
+    uint32_t size;
+    uint32_t crc;
+    char id[READER_BOOK_ID_MAX];
+} book_cache_header_t;
+
+static void cache_path(const char *id, char kind, char *out, size_t size)
+{
+    snprintf(out, size, "%s/.%c%08lx", BOOKS_BASE, kind, (unsigned long)reader_book_id(id));
+}
+
+static size_t cache_read(const char *id, char kind, uint32_t key1, uint32_t key2,
+                         void *data, size_t capacity)
+{
+    char path[32];
+    cache_path(id, kind, path, sizeof(path));
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return 0;
+    book_cache_header_t h;
+    bool valid = fread(&h, sizeof(h), 1, fp) == 1 && h.version == 1 &&
+                 h.key1 == key1 && h.key2 == key2 && h.size > 0 && h.size <= capacity &&
+                 strncmp(h.id, id, sizeof(h.id)) == 0 &&
+                 fread(data, 1, h.size, fp) == h.size &&
+                 reader_crc32(data, h.size) == h.crc &&
+                 fgetc(fp) == EOF && !ferror(fp);
+    fclose(fp);
+    return valid ? h.size : 0;
+}
+
+static void cache_write(const char *id, char kind, uint32_t key1, uint32_t key2,
+                        const void *data, size_t size)
+{
+    char path[32];
+    cache_path(id, kind, path, sizeof(path));
+    book_cache_header_t h = {.version = 1, .key1 = key1, .key2 = key2,
+                             .size = size, .crc = reader_crc32(data, size)};
+    snprintf(h.id, sizeof(h.id), "%s", id);
+    FILE *fp = fopen(path, "wb");
+    if (!fp) return;
+    bool written = fwrite(&h, sizeof(h), 1, fp) == 1 && fwrite(data, 1, size, fp) == size;
+    if (fclose(fp) != 0) written = false;
+    if (!written) remove(path);
+}
+
+static bool cache_invalidate(const char *id, char kind)
+{
+    char path[32];
+    cache_path(id, kind, path, sizeof(path));
+    return remove(path) == 0 || errno == ENOENT;
+}
+
+int reader_store_history_load(const char *id, uint32_t offset, uint32_t layout,
+                              uint32_t history[READER_PAGE_HISTORY_MAX])
+{
+    if (!s_spiffs_mounted || !valid_uploaded_id(id)) return 0;
+    size_t n = cache_read(id, 'h', offset, layout, history,
+                          READER_PAGE_HISTORY_MAX * sizeof(*history));
+    if (n % sizeof(*history)) return 0;
+    int count = (int)(n / sizeof(*history));
+    for (int i = 0; i < count; ++i) {
+        if (history[i] >= offset || (i > 0 && history[i - 1] >= history[i])) return 0;
+    }
+    return count;
+}
+
+void reader_store_history_save(const char *id, uint32_t offset, uint32_t layout,
+                               const uint32_t *history, int count)
+{
+    if (!s_spiffs_mounted || !valid_uploaded_id(id) ||
+        !history || count <= 0 || count > READER_PAGE_HISTORY_MAX) return;
+    cache_write(id, 'h', offset, layout, history, (size_t)count * sizeof(*history));
 }
 
 static void sanitize_name(const char *in, char *out)
@@ -383,64 +462,65 @@ static void copy_title(const char *line, size_t len, char *dst, size_t dst_size)
     dst[used] = '\0';
 }
 
-esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out)
+static void index_add_line(reader_book_index_t *out, const char *line, size_t len,
+                           size_t offset)
+{
+    if (!len || out->count >= READER_MAX_CHAPTERS || !reader_chapter_match(line, len)) return;
+    reader_chapter_info_t *item = &out->items[out->count++];
+    item->offset = offset;
+    copy_title(line, len, item->title, sizeof(item->title));
+}
+
+esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out,
+                                   reader_index_progress_fn progress, void *ctx)
 {
     if (!id || !out) return ESP_ERR_INVALID_ARG;
-    memset(out, 0, sizeof(*out));
+    reader_zdx_t *z = zdx_for(id);
+    if (!z) return ESP_ERR_NOT_FOUND;
+    uint32_t total = z->original_size;
+    uint32_t file_size = (uint32_t)z->file_size;
+    bool cacheable = s_spiffs_mounted && valid_uploaded_id(id);
+    if (cacheable && cache_read(id, 'i', total, file_size, out, sizeof(*out)) == sizeof(*out) &&
+        out->count > 0 && out->count <= READER_MAX_CHAPTERS) return ESP_OK;
 
-    // A 1 KiB window cuts the number of streaming reads by 4x on a long
-    // novel; static storage keeps it off the 6 KiB input task's stack.
+    memset(out, 0, sizeof(*out));
     static char chunk[1024];
     char line[192];
     size_t line_len = 0;
     size_t line_start = 0;
     size_t absolute = 0;
+    if (progress) progress(0, total, ctx);
 
-    while (out->count < READER_MAX_CHAPTERS) {
-        int n = reader_store_read(id, absolute, chunk, sizeof(chunk));
-        if (n <= 0) break;
-        for (int i = 0; i < n; ++i) {
-            char c = chunk[i];
-            size_t pos = absolute + (size_t)i;
-            // One UTF-8 code point per leading byte (ASCII included), minus
-            // ASCII blanks and a leading UTF-8 BOM. This is the "字数" shown
-            // on the title card; it costs no extra flash read because the
-            // chapter scan already streams the entire book.
-            unsigned char uc = (unsigned char)c;
-            if ((uc & 0xC0u) != 0x80u && uc != ' ' && uc != '\t' &&
-                !(pos < 3 && (uc == 0xEFu || uc == 0xBBu || uc == 0xBFu))) {
+    while (absolute < total) {
+        size_t chunk_len = reader_zdx_read(z, absolute, chunk, sizeof(chunk));
+        if (chunk_len == 0) return ESP_FAIL;
+        for (size_t i = 0; i < chunk_len; ++i) {
+            unsigned char c = (unsigned char)chunk[i];
+            size_t pos = absolute + i;
+            // Count UTF-8 leading bytes, excluding ASCII whitespace and a BOM.
+            if ((c & 0xC0u) != 0x80u && c != ' ' && (c < '\t' || c > '\r') &&
+                !(pos < 3 && (c == 0xEFu || c == 0xBBu || c == 0xBFu))) {
                 ++out->char_count;
             }
+            if (out->count >= READER_MAX_CHAPTERS) continue;
             if (c == '\n' || c == '\r') {
-                if (line_len > 0 &&
-                    reader_chapter_match(line, line_len) &&
-                    out->count < READER_MAX_CHAPTERS) {
-                    reader_chapter_info_t *item = &out->items[out->count++];
-                    item->offset = line_start;
-                    copy_title(line, line_len, item->title, sizeof(item->title));
-                }
+                index_add_line(out, line, line_len, line_start);
                 line_len = 0;
                 line_start = pos + 1;
             } else if (line_len + 1 < sizeof(line)) {
-                line[line_len++] = c;
+                line[line_len++] = (char)c;
             }
         }
-        absolute += (size_t)n;
-        if ((size_t)n < sizeof(chunk)) {
-            // Last line without a newline.
-            if (line_len > 0 && reader_chapter_match(line, line_len) &&
-                out->count < READER_MAX_CHAPTERS) {
-                reader_chapter_info_t *item = &out->items[out->count++];
-                item->offset = line_start;
-                copy_title(line, line_len, item->title, sizeof(item->title));
-            }
-        }
+        absolute += chunk_len;
+        if (progress) progress(absolute, total, ctx);
+        if (absolute % (32u * 1024u) == 0) vTaskDelay(1);
     }
+    index_add_line(out, line, line_len, line_start);
     if (out->count == 0) {
-        out->items[0].offset = 0;
         snprintf(out->items[0].title, sizeof(out->items[0].title), "%s", "开篇");
         out->count = 1;
     }
+    if (cacheable) cache_write(id, 'i', total, file_size, out, sizeof(*out));
     return ESP_OK;
 }
 
@@ -502,36 +582,47 @@ esp_err_t reader_store_write_chunk(const char *data, size_t len)
         return ESP_ERR_TIMEOUT;
     }
     esp_err_t err = ESP_OK;
-    if (!s_upload_fp || fwrite(data, 1, len, s_upload_fp) != len) {
-        err = ESP_FAIL;
+    if (!s_upload_fp) {
+        err = ESP_ERR_INVALID_STATE;
+    } else if (fwrite(data, 1, len, s_upload_fp) != len) {
+        err = errno == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
     }
     xSemaphoreGive(s_upload_lock);
     return err;
 }
 
 // Verify a freshly uploaded zdx and count unsupported code points by streaming
-// its ORIGINAL text through the same decoder the reader uses. Runs on the HTTP
-// worker task with a stack-local decoder (~18 KiB), so never call this from the
-// small input task. Returns 0 on success, -1 when the image is invalid.
-static int verify_and_count(const char *path, uint32_t *unsupported_out)
+// its original text in one pass. The decoder validates each chunk as it is read.
+// The HTTP task uses a dedicated static decoder.
+static int verify_and_count(const char *path, reader_charset_report_t *coverage_out)
 {
     FILE *fp = fopen(path, "rb");
     if (!fp) return -1;
     reader_zdx_t *z = &s_verify_zdx;
-    if (reader_zdx_open(z, fp) != 0 || reader_zdx_verify(z) != 0) {
+    // A noncanonical image can contain an empty final chunk. Verify any
+    // chunks that the original-length walker would otherwise never visit.
+    if (reader_zdx_open(z, fp) != 0 ||
+        ((uint64_t)(z->chunk_count - 1) * z->chunk_size >= z->original_size &&
+         reader_zdx_verify(z) != 0)) {
+        reader_zdx_close(z);
         fclose(fp);
         return -1;
     }
 
     char buf[512 + 4];
     size_t carry = 0;
-    uint32_t total = 0;
+    reader_charset_report_t total = {0};
     size_t offset = 0;
     while (offset < z->original_size) {
         size_t n = reader_zdx_read(z, offset, buf + carry, 512);
-        if (n == 0) { fclose(fp); return -1; }
+        if (n == 0) {
+            reader_zdx_close(z);
+            fclose(fp);
+            return -1;
+        }
         size_t len = carry + n;
         offset += n;
+        if (offset % (32u * 1024u) == 0) vTaskDelay(1);
 
         // Do not scan an incomplete UTF-8 sequence at the window boundary;
         // carry those bytes into the next window instead of miscounting them.
@@ -552,7 +643,7 @@ static int verify_and_count(const char *path, uint32_t *unsupported_out)
         if (usable > 0) {
             reader_charset_report_t report;
             if (reader_scan_charset(buf, usable, reader_font_supported_cb, NULL, &report) == 0) {
-                total += report.unsupported;
+                reader_charset_report_merge(&total, &report);
             }
         }
         carry = len - usable;
@@ -562,7 +653,7 @@ static int verify_and_count(const char *path, uint32_t *unsupported_out)
     // Any leftover carried bytes are an incomplete UTF-8 tail; ignore them.
     reader_zdx_close(z);
     fclose(fp);
-    if (unsupported_out) *unsupported_out = total;
+    if (coverage_out) *coverage_out = total;
     return 0;
 }
 
@@ -587,7 +678,7 @@ static bool commit_upload(const char *tmp, const char *dst, const char *id)
     return committed;
 }
 
-esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
+esp_err_t reader_store_finish_upload(const char *id, reader_charset_report_t *coverage_out)
 {
     if (!valid_uploaded_id(id) || !s_upload_lock) return ESP_ERR_INVALID_ARG;
     if (xSemaphoreTake(s_upload_lock, pdMS_TO_TICKS(1000)) != pdTRUE) return ESP_ERR_TIMEOUT;
@@ -596,6 +687,7 @@ esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
         return ESP_ERR_INVALID_STATE;
     }
     int close_result = fclose(s_upload_fp);
+    int close_error = errno;
     s_upload_fp = NULL;
 
     char tmp[READER_BOOK_ID_MAX + 16];
@@ -603,22 +695,28 @@ esp_err_t reader_store_finish_upload(const char *id, uint32_t *unsupported_out)
     tmp_path(tmp, sizeof(tmp));
     book_path(id, dst, sizeof(dst));
 
-    uint32_t unsupported = 0;
-    if (close_result != 0 || verify_and_count(tmp, &unsupported) != 0) {
+    reader_charset_report_t coverage = {0};
+    if (close_result != 0) {
+        remove(tmp);
+        xSemaphoreGive(s_upload_lock);
+        return close_error == ENOSPC ? ESP_ERR_NO_MEM : ESP_FAIL;
+    }
+    if (verify_and_count(tmp, &coverage) != 0) {
         ESP_LOGW(TAG, "上传文件不是有效的 zdx 或已损坏: %s", tmp);
         remove(tmp);
         xSemaphoreGive(s_upload_lock);
         return ESP_ERR_INVALID_ARG;
     }
     zdx_cache_close();  // invalidate any decoder pointing at the old file
-    esp_err_t err = commit_upload(tmp, dst, id) ? ESP_OK : ESP_FAIL;
+    esp_err_t err = cache_invalidate(id, 'i') && cache_invalidate(id, 'h') &&
+                    commit_upload(tmp, dst, id) ? ESP_OK : ESP_FAIL;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "保存上传书籍失败: %s", dst);
         remove(tmp);
     } else {
-        ESP_LOGI(TAG, "已保存 %s (%u 个未覆盖字符)", id, (unsigned)unsupported);
+        ESP_LOGI(TAG, "已保存 %s (%u 个未覆盖字符)", id, (unsigned)coverage.unsupported);
     }
-    if (unsupported_out) *unsupported_out = unsupported;
+    if (coverage_out) *coverage_out = coverage;
     xSemaphoreGive(s_upload_lock);
     return err;
 }
@@ -644,7 +742,10 @@ esp_err_t reader_store_delete(const char *id)
     if (s_zdx_open && strcmp(s_zdx_id, id) == 0) zdx_cache_close();
     char path[READER_BOOK_ID_MAX + 16];
     book_path(id, path, sizeof(path));
-    return remove(path) == 0 ? ESP_OK : ESP_ERR_NOT_FOUND;
+    if (remove(path) != 0) return ESP_ERR_NOT_FOUND;
+    (void)cache_invalidate(id, 'i');
+    (void)cache_invalidate(id, 'h');
+    return ESP_OK;
 }
 
 static void progress_save_locked(void)

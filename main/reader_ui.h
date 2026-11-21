@@ -37,6 +37,9 @@ void reader_ui_deinit(void);
 // every widget with the new colours; in-place refresh calls do not recolour.
 void reader_ui_set_dark(bool dark);
 
+// Overlay for a long-running book-open operation. Replaced on the next render.
+void reader_ui_update_loading(const char *title, const char *phase, unsigned percent);
+
 // Transient reader-footer message (e.g. "已添加书签"). An empty string restores
 // the default key hint on the next full render.
 void reader_ui_set_hint(const char *text);

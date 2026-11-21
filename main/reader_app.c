@@ -20,6 +20,7 @@
 #include "reader_transfer.h"
 #include "reader_ui.h"
 
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -31,7 +32,7 @@ static const char *TAG = "reader_app";
 // upper bound is derived and asserted per font size in reader_layout.c, so a
 // full page of Hanzi can never be silently truncated by the paginator.
 #define PAGE_TEXT_SIZE    READER_LAYOUT_MAX_PAGE_BYTES
-#define HISTORY_DEPTH     64
+#define HISTORY_DEPTH     READER_PAGE_HISTORY_MAX
 #define TICK_PERIOD_MS    1000
 #define AUTO_PAGE_MS      4000
 #define LONG_IGNORE_MS    400
@@ -102,6 +103,11 @@ typedef struct {
 } reader_app_state_t;
 
 static reader_app_state_t s_state;
+// Opening runs on the input worker; the LVGL tick must not replace its overlay.
+static atomic_bool s_loading;
+static uint32_t s_loading_started;
+static uint32_t s_loading_updated;
+
 static uint32_t s_history[HISTORY_DEPTH];
 static int s_history_count;
 static QueueHandle_t s_queue;
@@ -220,6 +226,18 @@ static void prepare_page(void)
         if (s_state.index.items[i].offset <= s_state.page_offset) best = i;
     }
     s_state.chapter = best;
+}
+
+static uint32_t history_layout_key(void)
+{
+    // Bump the high bits when pagination rules change.
+    return 0x10000u | ((uint32_t)s_state.font_size << 1) | (s_state.immersive != 0);
+}
+
+static void save_resume_history(void)
+{
+    reader_store_history_save(s_state.current_id, s_state.page_offset, history_layout_key(),
+                               s_history, s_history_count);
 }
 
 static void persist_progress(void)
@@ -392,11 +410,28 @@ static uint32_t chapter_start_offset(int chapter)
     return (uint32_t)s_state.index.items[chapter].offset;
 }
 
+static void show_loading_progress(const char *phase, size_t done, size_t total)
+{
+    uint32_t now = now_ms();
+    if (now - s_loading_started < 150u || now - s_loading_updated < 100u) return;
+    if (!bsp_lvgl_lock(20)) return;
+    unsigned percent = total ? (unsigned)((uint64_t)done * 100u / total) : 100;
+    reader_ui_update_loading(s_state.current_title, phase, percent);
+    bsp_lvgl_unlock();
+    s_loading_updated = now;
+}
+
+static void index_loading_progress(size_t done, size_t total, void *ctx)
+{
+    (void)ctx;
+    show_loading_progress("正在加载目录", done, total);
+}
+
 // Walk the chapter from `from` up to `to`, pushing every page start onto the
 // back history. Without this the first UP press after opening a book or jumping
 // to a chapter does nothing, because forward paging used to be the only thing
 // that ever pushed history.
-static void rebuild_history(uint32_t from, uint32_t to)
+static void rebuild_history_walk(uint32_t from, uint32_t to, bool show_progress)
 {
     history_reset();
     if (!s_state.current_id[0] || from >= to) return;
@@ -413,13 +448,22 @@ static void rebuild_history(uint32_t from, uint32_t to)
                             out, sizeof(out), &page) != 0) break;
         if (page.next == 0) break;
         uint32_t next = cur + (uint32_t)page.next;
-        if (next >= to) break;
+        if (next > to) break;
         history_push(cur);
         cur = next;
+        if (show_progress) {
+            show_loading_progress("正在恢复阅读位置", cur - from, to - from);
+            if ((guard & 31) == 31) vTaskDelay(1);
+        }
     }
     // If the walk stopped short, the recorded page starts do not chain into the
     // current page; discard them rather than turning back to a wrong offset.
     if (cur < to) history_reset();
+}
+
+static void rebuild_history(uint32_t from, uint32_t to)
+{
+    rebuild_history_walk(from, to, false);
 }
 
 // Last-resort back step for books without chapter headings (or when the walk
@@ -506,6 +550,8 @@ static int prev_chapter_last_page(uint32_t *out)
 // last row (book_count) is the pinned settings action. Keeping the list index
 // in s_state.selected means returning to the shelf highlights the very book
 // the reader just left.
+static void set_hint(const char *text);
+
 static void open_book(int list_index)
 {
     int book_idx = list_index;
@@ -535,23 +581,43 @@ static void open_book(int list_index)
         render_screen();
     }
 
+    atomic_store(&s_loading, true);
+    s_loading_started = now_ms();
+    s_loading_updated = s_loading_started;
     uint16_t saved_chapter = 0;
     s_state.page_offset = reader_store_get_offset(s_state.current_id, &saved_chapter);
     if (s_state.page_offset > s_state.book_size) s_state.page_offset = 0;
-    (void)reader_store_build_index(s_state.current_id, &s_state.index);
+    if (reader_store_build_index(s_state.current_id, &s_state.index,
+                                index_loading_progress, NULL) != ESP_OK) {
+        s_state.current_id[0] = '\0';
+        s_state.screen = READER_SCREEN_LIBRARY;
+        set_hint("书籍加载失败");
+        atomic_store(&s_loading, false);
+        return;
+    }
     s_state.book_chars = s_state.index.char_count;
     s_state.toc_selected = saved_chapter < s_state.index.count ? saved_chapter : 0;
     s_state.chapter = (int)s_state.toc_selected;
     prepare_page();
     // Rebuild the back history up to the resumed page so the first UP press
     // turns back instead of being swallowed by an empty stack.
-    rebuild_history(chapter_start_offset(s_state.chapter), s_state.page_offset);
+    s_history_count = reader_store_history_load(s_state.current_id, s_state.page_offset,
+                                                history_layout_key(), s_history);
+    if (!s_history_count) {
+        rebuild_history_walk(chapter_start_offset(s_state.chapter), s_state.page_offset, true);
+        save_resume_history();
+    }
     s_state.screen = first_open ? READER_SCREEN_COVER : READER_SCREEN_READER;
+    note_activity();
+    atomic_store(&s_loading, false);
 }
 
 static void close_book(void)
 {
-    if (s_state.current_id[0]) persist_progress();
+    if (s_state.current_id[0]) {
+        persist_progress();
+        save_resume_history();
+    }
     s_state.current_id[0] = '\0';
     s_auto_mode = 0;
     s_state.screen = READER_SCREEN_LIBRARY;
@@ -588,7 +654,10 @@ static void page_delta(int delta, int persist)
     }
     prepare_page();
     note_activity();
-    if (persist && ++s_unpersisted_pages >= PERSIST_EVERY) persist_progress();
+    if (persist && ++s_unpersisted_pages >= PERSIST_EVERY) {
+        persist_progress();
+        save_resume_history();
+    }
 }
 
 static void goto_chapter(int index)
@@ -1173,7 +1242,7 @@ void reader_app_on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 {
     (void)user;
     // Runs on the button component's shared esp_timer task: enqueue only.
-    if (!s_queue || !s_ready) return;
+    if (!s_queue || !s_ready || atomic_load(&s_loading)) return;
     input_event_t in = { .btn = (int)btn, .event = (int)ev };
     (void)xQueueSend(s_queue, &in, 0);
 }
@@ -1182,6 +1251,7 @@ void reader_app_on_key(bsp_btn_t btn, bsp_btn_ev_t ev, void *user)
 static void tick(lv_timer_t *timer)
 {
     (void)timer;
+    if (atomic_load(&s_loading)) return;
 
     // Retire the transient footer hint once its two seconds are up. The shelf,
     // TOC and reader all show the hint in place of their normal key chips, so

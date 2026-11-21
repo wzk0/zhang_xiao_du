@@ -114,6 +114,10 @@ run_static_checks() {
         components/uzlib/adler32.c \
         -o "${test_dir}/test_reader_app_navigation"
     "${test_dir}/test_reader_app_navigation"
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_reader_fallback.c main/reader_fallback.c \
+        -o "${test_dir}/test_reader_fallback"
+    "${test_dir}/test_reader_fallback"
     PYTHONDONTWRITEBYTECODE=1 python3 tests/test_reader_font_coverage.py
     PYTHONDONTWRITEBYTECODE=1 python3 tools/gen_reader_font.py --check
     PYTHONDONTWRITEBYTECODE=1 python3 tools/gen_builtin_books.py --check

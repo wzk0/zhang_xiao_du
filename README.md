@@ -42,8 +42,14 @@
 | ... | chunk data | 依次拼接的 raw-deflate 流 |
 
 - **转换在浏览器里完成**：热点没有外网，`assets/web/transfer.html` 用内联 pako
-  （`raw: true, windowBits: 12, level: 9`）分块压缩后把镜像 POST 上去；`.txt` 上限
-  2 MB，产物上限 512 KB（`READER_MAX_UPLOAD_BYTES`）。
+  （`raw: true, windowBits: 12, level: 9`）分块压缩后上传。网页显示书库当前可上传
+  的压缩包大小，设备在写入前重新检查剩余空间并预留文件系统开销。原始 `.txt` 可超过
+  2 MB，转换速度和可处理的大小取决于浏览器及设备内存。
+- **打开大书**：首次扫描显示目录进度。上传书的目录与最近翻页记录会写入书库缓存，
+  再打开时可复用；替换或删除书籍会清除相关缓存。
+- **补字库**：保留原有九套主字形，共用文泉驿点阵宋体的 16 像素 GB2312 二级汉字补字库。
+  缺字时按当前字号渲染，补字数据存于应用分区。上传仍缺字的书时，网页会列出部分字符及
+  Unicode 码点。用 `tools/gen_reader_fallback.py` 和文泉驿的 `wenquanyi_12pt.bdf` 可重新生成。
 - **内置书**：`assets/books/*.txt` 是唯一原文，`tools/gen_builtin_books.py` 生成
   `main/builtin_books_data.c`；设备用 `reader_zdx_open_mem()` 直接读 Flash 镜像，
   不占额外 RAM。字体生成器也扫描这些 `.txt`，保证内置书用到的字都有字形。

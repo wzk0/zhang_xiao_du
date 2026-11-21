@@ -12,6 +12,9 @@
 // dividing by zero or reporting a nonsense >100 value.
 int reader_storage_percent(size_t part, size_t total);
 
+// Maximum temporary upload payload, with headroom for SPIFFS metadata.
+size_t reader_storage_upload_budget(size_t free_bytes);
+
 // Compose one Chinese sentence estimating how many more books/articles fit in
 // `free_bytes`. The reference work is picked from a small table of well-known
 // titles according to how much space is left, so the numbers stay meaningful.

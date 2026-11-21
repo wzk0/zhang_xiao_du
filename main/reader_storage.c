@@ -4,6 +4,14 @@
 #include <stdio.h>
 #include <string.h>
 
+size_t reader_storage_upload_budget(size_t free_bytes)
+{
+    // Keep the existing 8 KiB reserve and allow for additional index pages
+    // as the temporary file grows.
+    const size_t reserve = 8u * 1024u + free_bytes / 64u;
+    return free_bytes > reserve ? free_bytes - reserve : 0;
+}
+
 // Approximate UTF-8 sizes of well-known works, used only as yardsticks. They
 // are deliberately round: the point is an intuitive "about N more", not a
 // byte-exact library catalogue. A "book" is a long work, an "article" a short

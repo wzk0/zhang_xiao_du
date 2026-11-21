@@ -52,12 +52,13 @@ li button{width:auto;padding:0;background:transparent;color:var(--accent);font-s
 <body>
 <div class="card">
   <h1>掌小读 · 传书</h1>
-  <p class="hint">手机已连接设备热点。选择纯文本 .txt 文件，本页会自动检测编码、转成 UTF-8，再压缩为设备专用的 .zdx 格式后上传——同样大小的空间能多装好几倍的书。上传过程请保持页面打开。</p>
+  <p class="hint">手机已连接设备热点。选择纯文本 .txt 文件，本页会自动检测编码、转成 UTF-8，再压缩为设备专用的 .zdx 格式后上传——同样大小的空间能多装好几倍的书。请保持页面打开。若连接短暂中断，重新连上设备热点后可续传。</p>
 
   <div class="space">
     <div class="label">剩余存储空间</div>
     <div class="big" id="free">读取中…</div>
     <div class="small" id="detail"></div>
+    <div class="small" id="uploadLimit"></div>
     <div class="bar"><i id="bar"></i></div>
   </div>
 
@@ -75,13 +76,13 @@ li button{width:auto;padding:0;background:transparent;color:var(--accent);font-s
     <pre id="encPreview" style="display:none"></pre>
     <p class="hint" style="margin-bottom:0">选择文件后，本页先读取字节：能用 UTF-8 严格解码就按 UTF-8 处理；否则按 GBK 解码、重新编码为 UTF-8，同时去掉 BOM、把 CRLF 统一为 LF。<br>
     随后把正文按 4 KB 分块、逐块压缩成设备专用的 .zdx 格式（中文通常压到原大小的几分之一），再上传。设备热点下没有外网，所有处理都在这一个页面里完成，无需手动另存或借助电脑。<br>
-    原文件最大 2 MB，压缩后的 .zdx 需在 512 KB 以内。上传后页面会显示实际占用空间与生僻字数量。</p>
+    压缩后的 .zdx 能否上传取决于书库可用空间。上传后页面会显示实际占用空间与生僻字数量。</p>
   </div>
 
   <h2>书架上的书籍</h2>
   <ul id="list"><li><span>读取中…</span></li></ul>
 
-  <p class="hint">界面与内置书使用随固件编译的中文字库，常用简体汉字（GB2312 一级）与标点可直接显示；生僻字会显示为方框，上传完成后会提示数量。<br>
+  <p class="hint">设备支持 GB2312 一级、二级汉字及内置标点。若书里仍有字显示为方框，上传完成后会提示数量和部分缺字。<br>
   重新刷写 0x0 完整固件会清空已上传的书籍，内置示例书始终保留。</p>
 </div>
 <script>/*! pako 2.1.0 https://github.com/nodeca/pako @license (MIT AND Zlib) */
@@ -90,8 +91,7 @@ li button{width:auto;padding:0;background:transparent;color:var(--accent);font-s
 <script>
 // ---- 常量（与设备端 reader_zdx.h 一致）----------------------------------
 var ZDX_MAGIC='ZDX1', ZDX_VERSION=1, ZDX_CHUNK=4096, ZDX_HEADER=32, ZDX_TABLE=8;
-var SRC_MAX=2*1024*1024;      // 源 txt 上限 2 MB
-var ZDX_MAX=512*1024;         // 压缩后 zdx 上限（设备上传上限）
+var ZDX_MAX_CHUNKS=131072;
 
 function fmtSize(b){
   if(b>=1048576) return (b/1048576).toFixed(2)+' MB';
@@ -100,16 +100,31 @@ function fmtSize(b){
 }
 function esc(s){return String(s).replace(/[&<>"]/g,function(c){
   return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function readSpace(){
+  return fetch('/space').then(function(r){
+    if(!r.ok) throw new Error('书库空间读取失败');
+    return r.json();
+  }).then(function(d){
+    if(!d||!Number.isSafeInteger(d.upload_max)||d.upload_max<0)
+      throw new Error('书库空间读取失败');
+    return d;
+  });
+}
 var refreshSequence=0;
 function refresh(){
+  // The ESP HTTP server services the upload before other requests. Avoid
+  // filling its connection backlog with polls while a large upload is active.
+  if(document.getElementById('submit').disabled) return;
   var sequence=++refreshSequence;
   Promise.all([
-    fetch('/space').then(function(r){return r.ok?r.json():null;}).catch(function(){return null;}),
+    readSpace().catch(function(){return null;}),
     fetch('/list').then(function(r){if(!r.ok) throw Error();return r.json();})
   ]).then(function(result){
     if(sequence!==refreshSequence) return;
     var d=result[0], books=result[1];
     document.getElementById('free').textContent=d?fmtSize(d.free):'读取失败';
+    document.getElementById('uploadLimit').textContent=d?
+      '当前可上传压缩包：最多 '+fmtSize(d.upload_max):'';
     document.getElementById('detail').textContent=
       (d?'总计 '+fmtSize(d.total)+'　已用 '+fmtSize(d.used)+'　':'')+
       '共 '+books.length+' 本上传书籍';
@@ -124,6 +139,7 @@ function refresh(){
       title.textContent=b.name;size.textContent=fmtSize(b.size);size.className='tag';
       action.textContent='删除';action.type='button';
       action.onclick=function(){
+        if(document.getElementById('submit').disabled) return;
         if(!confirm('删除《'+b.name+'》及阅读记录？')) return;
         action.disabled=true;
         fetch('/delete?id='+encodeURIComponent(b.id),{method:'POST'})
@@ -138,12 +154,13 @@ function refresh(){
   }).catch(function(){
     if(sequence!==refreshSequence) return;
     document.getElementById('free').textContent='读取失败';
+    document.getElementById('uploadLimit').textContent='';
     document.getElementById('detail').textContent='请保持热点连接';
   });
 }
 
 // ---- 编码检测 -------------------------------------------------------------
-var pendingBlob=null, gConvertedText=null, fileSequence=0;
+var pendingBlob=null, uploadToken=null, gPreviewText=null, fileSequence=0;
 function detect(buf){
   var b=new Uint8Array(buf);
   if(b.length>=3 && b[0]===0xEF && b[1]===0xBB && b[2]===0xBF) return 'utf8-bom';
@@ -162,7 +179,7 @@ function detect(buf){
   try{ new TextDecoder('utf-8',{fatal:true}).decode(b); return 'utf8'; }
   catch(e){ return 'gbk'; }
 }
-function toUtf8Bytes(buf,enc){
+function prepareText(buf,enc){
   if(typeof TextDecoder==='undefined') return null;
   var b=new Uint8Array(buf),text;
   try{
@@ -170,45 +187,39 @@ function toUtf8Bytes(buf,enc){
                        : new TextDecoder('utf-8').decode(b);
   }catch(e){ return null; }
   text = text.replace(/^\uFEFF/,'').replace(/\r\n?/g,'\n');
-  gConvertedText = text;
-  return new TextEncoder().encode(text);
+  var chars=0;
+  for(var i=0;i<text.length;i++){if(!/\s/.test(text[i])) chars++;}
+  gPreviewText = text.slice(0,301);
+  return {bytes:new TextEncoder().encode(text), chars:chars};
 }
 
 // ---- zdx 编码（与 tools/zdx_codec.py / reader_zdx.c 逐字节一致）----------
 function u32(n){return [n&255,(n>>>8)&255,(n>>>16)&255,(n>>>24)&255];}
-function encodeZdx(raw){
+function encodeZdx(raw,chars){
   if(typeof pako==='undefined' || typeof pako.deflate!=='function')
     throw new Error('压缩组件未加载');
-  var chunks=[], comps=[];
-  for(var i=0;i<raw.length;i+=ZDX_CHUNK) chunks.push(raw.subarray(i,i+ZDX_CHUNK));
-  if(chunks.length===0) chunks.push(new Uint8Array(0));
-  for(var j=0;j<chunks.length;j++)
-    comps.push(pako.deflate(chunks[j],{level:9,raw:true,windowBits:12}));
 
-  var text='';
-  try{ text=new TextDecoder('utf-8').decode(raw); }catch(e){}
-  var chars=0;
-  for(var k=0;k<text.length;k++){ if(!/\s/.test(text[k])) chars++; }
+  var count=Math.max(1,Math.ceil(raw.length/ZDX_CHUNK));
+  if(count>ZDX_MAX_CHUNKS) throw new Error('原文超过 .zdx 格式可容纳的大小');
+  var header=new Uint8Array(ZDX_HEADER+count*ZDX_TABLE);
+  header.set([0x5A,0x44,0x58,0x31,ZDX_VERSION,1,0,0],0);
+  header.set(u32(ZDX_CHUNK),8);
+  header.set(u32(count),12);
+  header.set(u32(raw.length),16);
+  header.set(u32(chars),20);
 
-  var tableLen=comps.length*ZDX_TABLE;
-  var dataStart=ZDX_HEADER+tableLen;
-  var total=dataStart;
-  for(var m=0;m<comps.length;m++) total+=comps[m].length;
-  var out=new Uint8Array(total);
-  out.set([0x5A,0x44,0x58,0x31, ZDX_VERSION,1,0,0],0); // "ZDX1" + ver + flags + reserved
-  out.set(u32(ZDX_CHUNK),8);
-  out.set(u32(comps.length),12);
-  out.set(u32(raw.length),16);
-  out.set(u32(chars),20);
-  // 24..31 reserved 保持 0
-  var off=dataStart;
-  for(var q=0;q<comps.length;q++){
-    out.set(u32(off), ZDX_HEADER+q*ZDX_TABLE);
-    out.set(u32(comps[q].length), ZDX_HEADER+q*ZDX_TABLE+4);
-    out.set(comps[q], off);
-    off+=comps[q].length;
+  var parts=[header], offset=header.length;
+  for(var i=0;i<count;i++){
+    var start=i*ZDX_CHUNK;
+    var compressed=pako.deflate(raw.subarray(start,start+ZDX_CHUNK),
+                               {level:9,raw:true,windowBits:12});
+    var entry=ZDX_HEADER+i*ZDX_TABLE;
+    header.set(u32(offset),entry);
+    header.set(u32(compressed.length),entry+4);
+    parts.push(compressed);
+    offset+=compressed.length;
   }
-  return out;
+  return new Blob(parts,{type:'application/octet-stream'});
 }
 
 // ---- 交互 -----------------------------------------------------------------
@@ -222,14 +233,14 @@ function highlightGuide(on,jump){
   if(on&&jump&&box.scrollIntoView) box.scrollIntoView({behavior:'smooth',block:'nearest'});
 }
 function resetPreview(){
-  gConvertedText=null; previewBtn.style.display='none';
+  gPreviewText=null; previewBtn.style.display='none';
   previewBtn.textContent='查看转换后文本预览';
   document.getElementById('encPreview').style.display='none';
 }
 previewBtn.addEventListener('click',function(){
   var pre=document.getElementById('encPreview');
   if(pre.style.display==='none'){
-    var t=gConvertedText||'';
+    var t=gPreviewText||'';
     pre.textContent=t.slice(0,300)+(t.length>300?'\n…（仅显示前 300 字）':'');
     pre.style.display='block'; this.textContent='收起预览';
   }else{ pre.style.display='none'; this.textContent='查看转换后文本预览'; }
@@ -237,43 +248,41 @@ previewBtn.addEventListener('click',function(){
 
 document.getElementById('file').addEventListener('change',function(){
   var f=this.files[0], sequence=++fileSequence;
-  pendingBlob=null; encBox.className=''; encBox.innerHTML='';
+  pendingBlob=null; uploadToken=null; encBox.className=''; encBox.innerHTML='';
   highlightGuide(false,false); resetPreview();
   setState('选择 .txt 文件后，这里会显示编码检测与压缩结果。');
   if(!f) return;
-  if(f.size>SRC_MAX){ showEnc('<span class="warn">源文件超过 2 MB，无法上传。</span>');
-    setState('<span class="warn">源文件超过 2 MB。</span>'); return; }
   setState('正在检测编码并压缩…');
   var reader=new FileReader();
   reader.onload=function(e){
     if(sequence!==fileSequence) return;
     var enc=detect(e.target.result);
     var srcSize=f.size;
-    var utf8=toUtf8Bytes(e.target.result,enc);
-    if(!utf8){
+    var prepared;
+    try{ prepared=prepareText(e.target.result,enc); }
+    catch(err){
+      showEnc('<span class="warn">文本转换失败：'+esc(err.message||err)+'</span>');
+      setState('<span class="warn">文本转换失败，请重试。</span>');
+      return;
+    }
+    if(!prepared){
       showEnc('<span class="warn">检测到 GBK / ANSI 编码，但当前浏览器无法自动转换。</span>请换用较新的浏览器后重试，<a href="#convert">查看说明</a>。');
       setState('<span class="warn">⚠ 当前浏览器无法自动转换该编码。</span>请使用较新的浏览器。');
       highlightGuide(true,true); return;
     }
     var zdx;
-    try{ zdx=encodeZdx(utf8); }
+    try{ zdx=encodeZdx(prepared.bytes,prepared.chars); }
     catch(err){ showEnc('<span class="warn">压缩失败：'+esc(err.message||err)+'</span>');
       setState('<span class="warn">压缩失败，请重试。</span>'); return; }
-    pendingBlob=new Blob([zdx],{type:'application/octet-stream'});
-    var pct=srcSize?Math.round(zdx.length*100/srcSize):0;
+    pendingBlob=zdx;
+    var pct=srcSize?Math.round(zdx.size*100/srcSize):0;
     var encName=(enc==='gbk')?'GBK / ANSI':(enc==='utf8-bom'?'UTF-8（含 BOM，已去除）':'UTF-8');
     showEnc('<span class="ok">✓ '+esc(encName)+'</span> → 已压缩为 .zdx（'+
-      fmtSize(zdx.length)+'，原 '+fmtSize(srcSize)+' 的 '+pct+'%）');
+      fmtSize(zdx.size)+'，原 '+fmtSize(srcSize)+' 的 '+pct+'%）');
     setState('<span class="ok">✓ 已自动转码并压缩。</span> 原文件 '+fmtSize(srcSize)+
-      ' → 上传 '+fmtSize(zdx.length)+'（'+pct+'%，越小越省空间）。');
-    previewBtn.style.display=gConvertedText?'inline-block':'none';
+      ' → 上传 '+fmtSize(zdx.size)+'（'+pct+'%，越小越省空间）。');
+    previewBtn.style.display=gPreviewText?'inline-block':'none';
     if(enc==='gbk') highlightGuide(true,false);
-    if(zdx.length>ZDX_MAX){
-      showEnc('<span class="warn">压缩后仍超过 512 KB（'+fmtSize(zdx.length)+
-        '）</span>，请精简文本后重试。');
-      setState('<span class="warn">压缩后超过 512 KB 上传上限。</span> 请精简文本后重试。');
-      pendingBlob=null; resetPreview();
-    }
   };
   reader.onerror=function(){
     if(sequence!==fileSequence) return;
@@ -282,6 +291,66 @@ document.getElementById('file').addEventListener('change',function(){
   reader.readAsArrayBuffer(f);
 });
 
+var UPLOAD_CHUNK=32*1024;
+function makeUploadToken(){
+  // Session key only; the local hotspot does not authenticate users.
+  var token='';
+  for(var i=0;i<32;i++) token+=Math.floor(Math.random()*16).toString(16);
+  return token;
+}
+function uploadRequest(method,url,body,onProgress){
+  return new Promise(function(resolve,reject){
+    var xhr=new XMLHttpRequest();
+    xhr.open(method,url);
+    xhr.responseType='json';
+    xhr.timeout=45000;
+    if(onProgress) xhr.upload.onprogress=onProgress;
+    xhr.onload=function(){
+      if(xhr.response) resolve(xhr.response);
+      else reject(new Error('设备未返回上传结果'));
+    };
+    xhr.onerror=xhr.ontimeout=function(){reject(new Error('连接中断'));};
+    xhr.send(body);
+  });
+}
+
+async function uploadBook(name,blob,token,msg){
+  var query='token='+token+'&total='+blob.size;
+  var statusUrl='/upload?token='+token;
+  var startUrl='/upload/start?'+query;
+  var offset=0, state=null, failures=0;
+  for(;;){
+    var oldOffset=offset;
+    try{
+      if(!state) state=await uploadRequest('GET',statusUrl,null);
+      if(!state.ok||state.done) return state;
+      if(state.restart) state=await uploadRequest('POST',startUrl,new TextEncoder().encode(name));
+      if(!state.ok||state.done) return state;
+      if(state.restart||!Number.isSafeInteger(state.offset)||state.offset<0||state.offset>=blob.size)
+        throw new Error('设备未返回有效的续传位置');
+      offset=state.offset;
+      if(offset>oldOffset) failures=0;
+
+      var end=Math.min(blob.size,offset+UPLOAD_CHUNK);
+      msg.textContent='正在上传《'+name+'》 '+Math.floor(offset*100/blob.size)+'%';
+      state=await uploadRequest('POST','/upload?'+query+'&offset='+offset,blob.slice(offset,end),
+        function(event){
+          if(!event.lengthComputable) return;
+          var percent=Math.floor((offset+event.loaded)*100/blob.size);
+          msg.textContent=percent<100?'正在上传《'+name+'》 '+percent+'%':
+            '已发送《'+name+'》，等待设备校验…';
+        });
+      if(!state.ok||state.done) return state;
+      if(!state.restart&&state.offset<=offset) throw new Error('设备未确认新分段');
+    }catch(err){
+      state=null;
+      if(++failures>5) throw new Error('请重新连接热点，然后点「上传并加入书架」继续');
+      msg.textContent='连接中断，正在尝试续传（'+failures+'/5）…';
+      await new Promise(function(resolve){setTimeout(resolve,500*failures);});
+    }
+  }
+}
+
 document.getElementById('form').addEventListener('submit',function(e){
   e.preventDefault();
   var f=document.getElementById('file').files[0];
@@ -289,15 +358,20 @@ document.getElementById('form').addEventListener('submit',function(e){
   if(btn.disabled) return;
   if(!f){msg.textContent='请先选择文件';return;}
   if(!pendingBlob){msg.textContent='编码与压缩尚未完成，请稍候或重新选择文件';return;}
-  if(pendingBlob.size>ZDX_MAX){msg.textContent='压缩后文件过大，上限 512 KB';return;}
-  btn.disabled=true;msg.textContent='正在上传《'+f.name+'》…';
-  fetch('/upload?name='+encodeURIComponent(f.name),{method:'POST',body:pendingBlob})
-    .then(function(r){return r.json();}).then(function(d){
-      msg.textContent=d.ok?('已保存 '+d.name+'（占用 '+fmtSize(d.size)+'）'+
-        (d.unsupported?('，其中 '+d.unsupported+' 个生僻字可能显示为方框'):'，字符全部受支持'))
-        :('上传失败：'+(d.error||'未知错误'));
-      btn.disabled=false;refresh();
-    }).catch(function(err){msg.textContent='上传出错：'+err;btn.disabled=false;refresh();});
+  var blob=pendingBlob, sequence=fileSequence;
+  if(!uploadToken) uploadToken=makeUploadToken();
+  btn.disabled=true;msg.textContent='正在连接设备…';
+  uploadBook(f.name,blob,uploadToken,msg).then(function(d){
+    if(d.ok&&sequence===fileSequence) uploadToken=null;
+    var missing=d.missing&&d.missing.length?
+      '，示例：'+d.missing.map(function(cp){
+        return String.fromCodePoint(cp)+' (U+'+cp.toString(16).toUpperCase()+')';
+      }).join('、'):'';
+    msg.textContent=d.ok?('已保存 '+d.name+'（占用 '+fmtSize(d.size)+'）'+
+      (d.unsupported?('，其中 '+d.unsupported+' 个字符可能显示为方框'+missing):'，字符全部受支持'))
+      :('上传失败：'+(d.error||'未知错误'));
+  }).catch(function(err){msg.textContent='上传暂停：'+(err.message||err);})
+    .then(function(){btn.disabled=false;refresh();});
 });
 refresh();setInterval(refresh,5000);
 </script>

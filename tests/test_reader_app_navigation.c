@@ -64,11 +64,19 @@ static size_t g_cover_bytes;
 // Host tests exercise the "already reading" path by default; set to 1 to
 // simulate a book that has never been opened (no progress record).
 static int g_force_first_open;
+static unsigned g_loading_percent;
+static bool g_slow_index;
 
 void reader_ui_init(void) { }
 void reader_ui_deinit(void) { }
 void reader_ui_set_dark(bool dark) { (void)dark; }
 void reader_ui_set_hint(const char *text) { (void)text; }
+void reader_ui_update_loading(const char *title, const char *phase, unsigned percent)
+{
+    (void)title;
+    (void)phase;
+    g_loading_percent = percent;
+}
 void reader_ui_set_battery(const char *text) { (void)text; }
 
 void reader_ui_render_library(const reader_book_info_t *books, int count,
@@ -270,8 +278,13 @@ int reader_store_read(const char *id, size_t offset, char *buf, size_t len)
     return (int)n;
 }
 
-esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out)
+esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out,
+                                   reader_index_progress_fn progress, void *ctx)
 {
+    if (g_slow_index && progress) {
+        g_now_us += 200000;
+        progress(1, 2, ctx);
+    }
     memset(out, 0, sizeof(*out));
     char chunk[256], line[192];
     size_t line_len = 0, line_start = 0, absolute = 0;
@@ -316,6 +329,32 @@ esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out)
         out->count = 1;
     }
     return ESP_OK;
+}
+
+static uint32_t g_cached_history[READER_PAGE_HISTORY_MAX];
+static int g_cached_count;
+static uint32_t g_cached_offset, g_cached_layout;
+static char g_cached_id[READER_BOOK_ID_MAX];
+
+int reader_store_history_load(const char *id, uint32_t offset, uint32_t layout,
+                              uint32_t history[READER_PAGE_HISTORY_MAX])
+{
+    if (strcmp(id, g_cached_id) || offset != g_cached_offset || layout != g_cached_layout) {
+        return 0;
+    }
+    memcpy(history, g_cached_history, (size_t)g_cached_count * sizeof(*history));
+    return g_cached_count;
+}
+
+void reader_store_history_save(const char *id, uint32_t offset, uint32_t layout,
+                               const uint32_t *history, int count)
+{
+    if (count <= 0) return;
+    snprintf(g_cached_id, sizeof(g_cached_id), "%s", id);
+    g_cached_offset = offset;
+    g_cached_layout = layout;
+    g_cached_count = count;
+    memcpy(g_cached_history, history, (size_t)count * sizeof(*history));
 }
 
 bool reader_store_has_progress(const char *id)
@@ -515,6 +554,33 @@ static void test_finished_book_up_does_not_reboot(void)
 
 // A book with no saved progress shows its title first, then waits for a key.
 // The existing resume path must skip the card entirely.
+static void test_open_progress_and_resume_history(void)
+{
+    reset_fixture();
+    g_slow_index = true;
+    g_loading_percent = 0;
+    g_cached_id[0] = '\0';
+    open_first_book();
+    CHECK(g_loading_percent == 50);
+    g_slow_index = false;
+
+    tap(BSP_BTN_DOWN);
+    uint32_t page_one = s_state.page_offset;
+    tap(BSP_BTN_DOWN);
+    uint32_t page_two = s_state.page_offset;
+    CHECK(page_two > page_one);
+    hold(BSP_BTN_OK);
+    CHECK(g_cached_offset == page_two);
+    CHECK(g_cached_count >= 2);
+    g_now_us += 500000;
+    tap(BSP_BTN_OK);
+    CHECK(s_state.page_offset == page_two);
+    CHECK(s_history_count == g_cached_count);
+    tap(BSP_BTN_UP);
+    CHECK(s_state.page_offset == page_one);
+    g_cached_id[0] = '\0';
+}
+
 static void test_first_open_cover(void)
 {
     reset_fixture();
@@ -937,7 +1003,7 @@ static void test_all_builtin_books_readable(void)
 
         reader_book_index_t idx;
         memset(&idx, 0, sizeof(idx));
-        CHECK(reader_store_build_index(id, &idx) == ESP_OK);
+        CHECK(reader_store_build_index(id, &idx, NULL, NULL) == ESP_OK);
         CHECK(idx.count >= 2);
 
         char window[PAGE_WINDOW_SIZE];
@@ -957,6 +1023,7 @@ static void test_all_builtin_books_readable(void)
 int main(void)
 {
     test_first_open_cover();
+    test_open_progress_and_resume_history();
     test_cover_is_page_zero();
     test_finished_book_up_does_not_reboot();
     test_no_nested_pagination_windows();

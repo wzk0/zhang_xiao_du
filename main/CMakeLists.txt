@@ -11,6 +11,7 @@ idf_component_register(
          "reader_zdx.c"
          "reader_transfer.c"
          "reader_fonts.c"
+         "reader_fallback.c"
          "builtin_books.c"
          "builtin_books_data.c"
     INCLUDE_DIRS "."

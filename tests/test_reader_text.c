@@ -240,6 +240,12 @@ static void test_charset_scan(void)
     CHECK(r.sample_count == 1);
     CHECK(r.sample[0] == 0x9F98);
 
+    const char *again = "龘龘😀";
+    reader_charset_report_t chunk;
+    CHECK(reader_scan_charset(again, strlen(again), supported_up_to_9fff, NULL, &chunk) == 0);
+    reader_charset_report_merge(&r, &chunk);
+    CHECK(r.unsupported == 4);
+    CHECK(r.sample_count == 2 && r.sample[0] == 0x9F98 && r.sample[1] == 0x1F600);
     CHECK(reader_scan_charset(text, strlen(text), supported_up_to_9fff, NULL, NULL) == -1);
 }
 
