@@ -1,12 +1,12 @@
 name: Release v* firmware
 
-# A v* tag runs the complete gate and publishes a release. Manual runs can
-# produce the same artifacts for testing a branch.
+# A v* tag runs the complete gate, verifies the merged image and publishes a
+# GitHub Release. Building a branch without publishing lives in
+# build-firmware.yml, so nothing here depends on the ref type.
 on:
   push:
     tags:
       - "v*"
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -17,82 +17,10 @@ concurrency:
 
 jobs:
   build:
-    name: Build and verify firmware
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
-        with:
-          fetch-tags: true
-          persist-credentials: false
-
-      - name: Restore ccache
-        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
-        with:
-          path: .ccache
-          key: release-ccache-esp32c3-v5.5.3-${{ hashFiles('dependencies.lock', 'sdkconfig.defaults') }}-${{ github.sha }}
-          restore-keys: |
-            release-ccache-esp32c3-v5.5.3-${{ hashFiles('dependencies.lock', 'sdkconfig.defaults') }}-
-
-      - name: Run the complete gate (ESP-IDF 5.5.3 / esp32c3)
-        uses: espressif/esp-idf-ci-action@9d38657f3d789ca759b2b37aaf5ceffbc42c4f0d # v1
-        with:
-          esp_idf_version: v5.5.3
-          target: esp32c3
-          extra_docker_args: >-
-            -e CCACHE_DIR=/app/${{ github.repository }}/.ccache
-            -e IDF_CCACHE_ENABLE=1
-          command: ./tools/validate.sh
-
-      - name: Assemble release assets
-        run: |
-          set -euo pipefail
-          mkdir -p release
-          cp build/FoloToy-AI-Passport-full.bin release/
-          cp build/FoloToy-AI-Passport.bin release/
-          cp build/bootloader/bootloader.bin release/bootloader.bin
-          cp build/partition_table/partition-table.bin release/partition-table.bin
-          sed -e 's#bootloader/bootloader\.bin#bootloader.bin#' \
-              -e 's#partition_table/partition-table\.bin#partition-table.bin#' \
-              build/flash_args > release/flash_args
-          cp assets/web/transfer.html release/
-          git archive --format=zip --output=release/zhangxiaodu-source.zip HEAD
-          if [[ "${GITHUB_REF_TYPE}" == tag ]]; then
-            git for-each-ref --format='%(contents:body)' -- "${GITHUB_REF}" > release/notes.md
-          else
-            touch release/notes.md
-          fi
-          cat >> release/notes.md <<'NOTES'
-
-          ## 烧录与构建
-
-          初次安装可将 8 MB ESP32-C3 的合并镜像 `FoloToy-AI-Passport-full.bin`
-          从 `0x0` 烧录。合并烧录可能重置设置及书库。已有设备升级时，先确认分区表兼容，
-          可只把应用镜像 `FoloToy-AI-Passport.bin` 写入 `0x10000`，保留数据分区。
-          同目录的分段镜像可用 `python -m esptool --chip esp32c3 write_flash @flash_args` 烧录。
-
-          `SHA256SUMS.txt` 提供校验值。`zhangxiaodu-source.zip` 是此标签的源码。
-          在 ESP-IDF 5.5.3 环境运行 `./tools/validate.sh` 可执行主机测试并构建、校验合并镜像。
-          NOTES
-          (cd release && sha256sum \
-            FoloToy-AI-Passport-full.bin FoloToy-AI-Passport.bin \
-            bootloader.bin partition-table.bin flash_args transfer.html \
-            zhangxiaodu-source.zip > SHA256SUMS.txt)
-          ls -lh release
-
-      - name: Upload release assets
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: release-assets-${{ github.run_id }}
-          path: release/
-          if-no-files-found: error
-          retention-days: 7
+    uses: ./.github/workflows/_firmware-build.yml
 
   publish:
     name: Publish GitHub Release
-    # Manual dispatch builds and uploads the assets but must not create a
-    # release for a branch ref; only a real v* tag is published.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10

@@ -1,0 +1,18 @@
+# Manual run: build and verify the same images a release produces, for testing
+# a branch. Assets are uploaded as an artifact of this run only — a release is
+# never created (that needs a v* tag, see release.yml).
+name: Build firmware (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: ./.github/workflows/_firmware-build.yml
