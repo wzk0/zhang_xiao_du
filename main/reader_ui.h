@@ -23,8 +23,12 @@ typedef enum {
     READER_SCREEN_FINISHED,
     READER_SCREEN_STORAGE,
     READER_SCREEN_CONFIRM,
+    READER_SCREEN_BACKLIGHT,  // brightness ruler (same shape as the font picker)
+    READER_SCREEN_AUTOPAGE,   // auto page-turn interval ruler
     READER_SCREEN_COVER,   // first-open title card, shown during the load pause
 } reader_screen_t;
+
+#include "reader_settings.h"
 
 // Bytes for one bookmark label (UTF-8, NUL included). A label is a short
 // excerpt of the book text at the bookmark offset, never a chapter name.
@@ -54,25 +58,40 @@ void reader_ui_render_library(const reader_book_info_t *books, int count,
                               int selected, const char *battery);
 // `percent` is the share of the book that lies behind the current page, so the
 // last page reports 100. It is computed by the application, not here, because
-// only the paginator knows where the page ends. `immersive` strips every chrome
-// element (title, chapter, progress, battery, key hints) and uses the larger
-// full-height line budget; the ONLY exception is a transient bookmark toast.
+// only the paginator knows where the page ends. `page`/`page_count` are the
+// 1-based page number and the book's total page count under the CURRENT
+// geometry; both 0 means "not known yet" and the footer then shows percent only.
+// `immersive` strips every chrome element (title, chapter, progress, battery,
+// key hints) and uses the larger full-height line budget; the ONLY exception is
+// a transient bookmark toast.
 void reader_ui_render_reader(const char *title, const char *chapter,
                              const char *page_text, int font_size,
-                             int percent, const char *battery, int auto_mode,
-                             int immersive);
-// TOC screen with two tabs. mode: 0 = chapters, 1 = bookmarks. focus: 0 = the
-// tab row, 1 = the list. selected indexes the active list. The two tabs carry
-// their own counts, so no separate caption sits above them.
+                             int percent, int page, int page_count,
+                             const char *battery, int auto_mode, int immersive);
+// TOC screen with three tabs. mode: 0 = chapters, 1 = bookmarks, 2 = page
+// ranges. focus: 0 = the tab row, 1 = the list. selected indexes the active
+// list. Each tab carries its own count, so no separate caption sits above them.
 // `mark_titles` holds one excerpt label per bookmark (see reader_excerpt);
 // bookmark rows show the text the reader marked, not a chapter heading.
+// `page_groups` is how many READER_PAGEMAP_GROUP-sized ranges the page map has
+// (0 when the map is unavailable) and `page_count` is the total page count; the
+// page tab turns them into "1—10页" rows for books whose chapters are unreliable.
 void reader_ui_render_toc(const reader_book_index_t *index,
                           int mark_count, const char *const *mark_titles,
+                          int page_groups, int page_count,
                           int mode, int focus, int selected,
                           const char *battery);
+// `auto_seconds` is the auto page-turn interval (0 = off); the row opens its own
+// ruler page, exactly like 正文字号 and 屏幕亮度 do.
 void reader_ui_render_settings(int selected, int font_size, int backlight,
-                               int idle_seconds, int dark, int immersive,
-                               const char *battery);
+                               int auto_seconds, int idle_seconds, int dark,
+                               int immersive, const char *battery);
+// Brightness ruler: a big percentage, the ladder as dots, and the actual change
+// applied live while the reader scrolls it.
+void reader_ui_render_backlight_picker(int backlight, const char *battery);
+// Auto page-turn ruler. The page also carries the hint about the reading-screen
+// shortcut, because that is where the reader looks for it.
+void reader_ui_render_autopage_picker(int auto_seconds, const char *battery);
 // Storage page: remaining space, used/free percentages as a progress bar,
 // totals, and one generated "about N more works" hint.
 void reader_ui_render_storage(size_t total, size_t used, size_t free_bytes,

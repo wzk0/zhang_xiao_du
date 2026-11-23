@@ -11,24 +11,23 @@ LV_FONT_DECLARE(lv_font_reader_13);
 LV_FONT_DECLARE(lv_font_reader_14);
 LV_FONT_DECLARE(lv_font_reader_15);
 LV_FONT_DECLARE(lv_font_reader_16);
-LV_FONT_DECLARE(lv_font_reader_17);
 LV_FONT_DECLARE(lv_font_reader_18);
-LV_FONT_DECLARE(lv_font_reader_19);
 LV_FONT_DECLARE(lv_font_reader_20);
 LV_FONT_DECLARE(lv_font_montserrat_14);
 LV_FONT_DECLARE(lv_font_montserrat_20);
 
-#define READER_FONT_COUNT (READER_FONT_MAX_SIZE - READER_FONT_MIN_SIZE + 1)
+#define READER_FONT_COUNT READER_FONT_SIZE_COUNT
 
 // Writable shallow copies. The referenced bitmaps stay const in Flash; only the
 // descriptor (and its fallback pointer) is copied, with application lifetime.
 static lv_font_t s_fonts[READER_FONT_COUNT];
 static lv_font_t s_fallback_fonts[READER_FONT_COUNT];
 
+// One entry per row of g_reader_font_metrics, in the same order.
 static const lv_font_t *const k_flash_fonts[READER_FONT_COUNT] = {
     &lv_font_reader_12, &lv_font_reader_13, &lv_font_reader_14,
-    &lv_font_reader_15, &lv_font_reader_16, &lv_font_reader_17,
-    &lv_font_reader_18, &lv_font_reader_19, &lv_font_reader_20,
+    &lv_font_reader_15, &lv_font_reader_16, &lv_font_reader_18,
+    &lv_font_reader_20,
 };
 
 static bool fallback_descriptor(const lv_font_t *font, lv_font_glyph_dsc_t *out,
@@ -67,7 +66,7 @@ void reader_fonts_init(void)
             .get_glyph_bitmap = fallback_bitmap,
             .line_height = s_fonts[i].line_height,
             .base_line = s_fonts[i].base_line,
-            .dsc = reader_layout_metrics(READER_FONT_MIN_SIZE + i),
+            .dsc = &g_reader_font_metrics[i],
             .fallback = s_fonts[i].line_height >= 22 ? &lv_font_montserrat_20
                                                      : &lv_font_montserrat_14,
         };

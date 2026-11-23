@@ -2,6 +2,7 @@
 #include "reader_storage.h"
 
 #include <stdio.h>
+#include <stdbool.h>
 #include <string.h>
 
 size_t reader_storage_upload_budget(size_t free_bytes)
@@ -104,4 +105,54 @@ int reader_storage_hint(size_t free_bytes, char *out, size_t out_size)
         return -1;
     }
     return n;
+}
+
+// Upload file name -> display name. Only the extension is dropped: the original
+// name has no id suffix, so nothing else needs cleaning.
+void reader_storage_clean_title(const char *file_name, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!file_name) return;
+    size_t len = strlen(file_name);
+    if (len >= 4 && (!strcmp(file_name + len - 4, ".txt") ||
+                     !strcmp(file_name + len - 4, ".zdx"))) {
+        len -= 4;
+    }
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, file_name, len);
+    out[len] = '\0';
+}
+
+// The id generator appends "~%08lx" when a name has to be shortened. Strip it
+// again for display: the reader cares about the book's name, not about the
+// uniqueness trick behind its file name. A genuine name ending in "~" plus eight
+// hex digits is indistinguishable from that suffix, which is an accepted
+// trade-off for not storing a second name per book.
+void reader_storage_display_title(const char *file_name, char *out, size_t out_size)
+{
+    if (!out || out_size == 0) return;
+    out[0] = '\0';
+    if (!file_name) return;
+
+    size_t len = strlen(file_name);
+    if (len >= 4 && strcmp(file_name + len - 4, ".zdx") == 0) len -= 4;
+    if (len >= 9) {
+        const char *suffix = file_name + len - 9;
+        if (suffix[0] == '~') {
+            bool hex = true;
+            for (int i = 1; i < 9; ++i) {
+                const char c = suffix[i];
+                if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                    hex = false;
+                    break;
+                }
+            }
+            if (hex) len -= 9;
+        }
+    }
+    if (len == 0) len = 4;  // a bare "~xxxxxxxx.zdx" still needs a label
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, file_name, len);
+    out[len] = '\0';
 }

@@ -1,13 +1,18 @@
 # Name,   Type, SubType, Offset,   Size,     Flags
-# Minimal baseline + one SPIFFS partition for books uploaded over the local AP.
+# Minimal baseline + one LittleFS partition for books uploaded over the local AP.
 # A merged 0x0 flash leaves "books" blank; reader_store_init() formats it on
-# first boot. See docs/development/engineering/firmware-layout.md.
+# first boot. Layout rules live in AGENTS.md.
 #
-# The app is the nine-size Chinese font set (~2.1 MiB) plus ~1.5 MiB of Wi-Fi and
-# LVGL code: 3.59 MiB with -Os. factory stays at 4 MiB, which leaves ~430 KiB of
-# headroom for future features while every remaining byte goes to the book store
-# (3.94 MiB, up from 3.44 MiB).
+# factory is sized from the MEASURED application, not a guess. Building with
+# SDKCONFIG_DEFAULTS=sdkconfig.defaults (-Os, the configuration CI ships) gives a
+# 2.36 MiB image: seven Chinese font sizes instead of nine (~1.05 MiB of bitmap
+# and descriptor data), the 16 px fallback set, the built-in books, Wi-Fi, LVGL
+# and the application code. 2.5 MiB therefore leaves ~140 KiB of growth headroom
+# while every remaining byte goes to the book store.
+# Re-measure (build/FoloToy-AI-Passport.bin) before shrinking factory again: the
+# build fails loudly once the app no longer fits, but a silently full partition
+# is not the way to find out.
 nvs,      data, nvs,     0x9000,   0x6000,
 phy_init, data, phy,     0xf000,   0x1000,
-factory,  app,  factory, 0x10000,  0x400000,
-books,    data, spiffs,  0x410000, 0x3f0000,
+factory,  app,  factory, 0x10000,  0x280000,
+books,    data, littlefs,0x290000, 0x570000,

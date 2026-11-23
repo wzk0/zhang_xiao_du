@@ -5,13 +5,14 @@
 #include "reader_bookmark.h"
 #include "reader_fonts.h"
 #include "reader_progress.h"
+#include "reader_storage.h"
 #include "reader_text.h"
 #include "reader_zdx.h"
 
 #include "dirent.h"
 #include "esp_log.h"
 #include "esp_partition.h"
-#include "esp_spiffs.h"
+#include "esp_littlefs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -33,7 +34,10 @@ static const char *NVS_BOOKMARK_KEY = "bm";
 // with only one deletable built-in today, bit 1 is the one in use.
 static const char *NVS_HIDDEN_KEY = "hidden";
 
-static bool s_spiffs_mounted;
+static bool s_store_mounted;
+// Original upload name kept from begin_upload() to finish_upload(), so the shelf
+// can show what the reader picked instead of the storage id.
+static char s_upload_title[READER_BOOK_TITLE_MAX];
 static uint8_t s_hidden_builtins;
 static nvs_handle_t s_nvs;
 static bool s_nvs_open;
@@ -122,8 +126,12 @@ static void tmp_path(char *out, size_t out_size)
     snprintf(out, out_size, "%s/%s", BOOKS_BASE, READER_UPLOAD_TMP_NAME);
 }
 
-// SPIFFS counts the leading slash and NUL in its object-name limit.
-#define BOOK_ID_LIMIT (CONFIG_SPIFFS_OBJ_NAME_LEN - 2)
+// Longest stored book file name (bytes, without the leading slash). LittleFS
+// allows 64 bytes; 44 leaves room for the ".zdx" extension and the "~%08lx"
+// suffix, so a 13-character Chinese title fits without being hashed. Existing
+// books keep their (shorter) names: their ids are what NVS progress and
+// bookmarks are keyed by, so the budget may only grow.
+#define BOOK_ID_LIMIT 44
 #define BOOK_STEM_LIMIT (BOOK_ID_LIMIT - (sizeof(BOOK_EXT) - 1))
 #define REPLACE_BACKUP "/books/.replace.old"
 #define REPLACE_ID "/books/.replace.id"
@@ -139,51 +147,70 @@ static bool valid_uploaded_id(const char *id)
 
 // Hidden files are disposable. The full ID in the header prevents a filename
 // hash collision from loading another book's cache.
+// `aux` is a caller-defined word carried alongside the payload; the page-map
+// cache uses it for the total page count, which cannot be derived from the
+// anchors alone (the last group may be partial).
 typedef struct {
     uint32_t version;
     uint32_t key1;
     uint32_t key2;
+    uint32_t aux;
     uint32_t size;
     uint32_t crc;
     char id[READER_BOOK_ID_MAX];
 } book_cache_header_t;
+#define BOOK_CACHE_VERSION 2u
 
 static void cache_path(const char *id, char kind, char *out, size_t size)
 {
     snprintf(out, size, "%s/.%c%08lx", BOOKS_BASE, kind, (unsigned long)reader_book_id(id));
 }
 
-static size_t cache_read(const char *id, char kind, uint32_t key1, uint32_t key2,
-                         void *data, size_t capacity)
+static size_t cache_read_ex(const char *id, char kind, uint32_t key1, uint32_t key2,
+                            uint32_t *aux, void *data, size_t capacity)
 {
     char path[32];
     cache_path(id, kind, path, sizeof(path));
     FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
     book_cache_header_t h;
-    bool valid = fread(&h, sizeof(h), 1, fp) == 1 && h.version == 1 &&
+    bool valid = fread(&h, sizeof(h), 1, fp) == 1 && h.version == BOOK_CACHE_VERSION &&
                  h.key1 == key1 && h.key2 == key2 && h.size > 0 && h.size <= capacity &&
                  strncmp(h.id, id, sizeof(h.id)) == 0 &&
                  fread(data, 1, h.size, fp) == h.size &&
                  reader_crc32(data, h.size) == h.crc &&
                  fgetc(fp) == EOF && !ferror(fp);
     fclose(fp);
+    if (valid && aux) *aux = h.aux;
     return valid ? h.size : 0;
 }
 
-static void cache_write(const char *id, char kind, uint32_t key1, uint32_t key2,
-                        const void *data, size_t size)
+static size_t cache_read(const char *id, char kind, uint32_t key1, uint32_t key2,
+                         void *data, size_t capacity)
+{
+    return cache_read_ex(id, kind, key1, key2, NULL, data, capacity);
+}
+
+static void cache_write_ex(const char *id, char kind, uint32_t key1, uint32_t key2,
+                           uint32_t aux, const void *data, size_t size)
 {
     char path[32];
     cache_path(id, kind, path, sizeof(path));
-    book_cache_header_t h = {.version = 1, .key1 = key1, .key2 = key2,
-                             .size = size, .crc = reader_crc32(data, size)};
+    book_cache_header_t h = {.version = BOOK_CACHE_VERSION, .key1 = key1, .key2 = key2,
+                             .aux = aux, .size = size,
+                             .crc = reader_crc32(data, size)};
     snprintf(h.id, sizeof(h.id), "%s", id);
     FILE *fp = fopen(path, "wb");
     if (!fp) return;
     bool written = fwrite(&h, sizeof(h), 1, fp) == 1 && fwrite(data, 1, size, fp) == size;
     if (fclose(fp) != 0) written = false;
     if (!written) remove(path);
+}
+
+static void cache_write(const char *id, char kind, uint32_t key1, uint32_t key2,
+                        const void *data, size_t size)
+{
+    cache_write_ex(id, kind, key1, key2, 0, data, size);
 }
 
 static bool cache_invalidate(const char *id, char kind)
@@ -196,7 +223,7 @@ static bool cache_invalidate(const char *id, char kind)
 int reader_store_history_load(const char *id, uint32_t offset, uint32_t layout,
                               uint32_t history[READER_PAGE_HISTORY_MAX])
 {
-    if (!s_spiffs_mounted || !valid_uploaded_id(id)) return 0;
+    if (!s_store_mounted || !valid_uploaded_id(id)) return 0;
     size_t n = cache_read(id, 'h', offset, layout, history,
                           READER_PAGE_HISTORY_MAX * sizeof(*history));
     if (n % sizeof(*history)) return 0;
@@ -210,9 +237,46 @@ int reader_store_history_load(const char *id, uint32_t offset, uint32_t layout,
 void reader_store_history_save(const char *id, uint32_t offset, uint32_t layout,
                                const uint32_t *history, int count)
 {
-    if (!s_spiffs_mounted || !valid_uploaded_id(id) ||
+    if (!s_store_mounted || !valid_uploaded_id(id) ||
         !history || count <= 0 || count > READER_PAGE_HISTORY_MAX) return;
     cache_write(id, 'h', offset, layout, history, (size_t)count * sizeof(*history));
+}
+
+int reader_store_pagemap_load(const char *id, uint32_t geometry, uint32_t book_size,
+                              reader_pagemap_t *map)
+{
+    if (!s_store_mounted || !valid_uploaded_id(id) || !map || !map->anchors ||
+        map->capacity == 0) {
+        return 0;
+    }
+    uint32_t pages = 0;
+    size_t n = cache_read_ex(id, 'p', geometry, book_size, &pages, map->anchors,
+                             map->capacity * sizeof(uint32_t));
+    if (n == 0 || n % sizeof(uint32_t) != 0 || pages == 0) return 0;
+    uint32_t groups = (uint32_t)(n / sizeof(uint32_t));
+    if (groups == 0 || groups > map->capacity) return 0;
+    // The anchors must be strictly ascending and start at the book's first byte;
+    // anything else is a stale/corrupt record and forces a rebuild.
+    if (map->anchors[0] != 0) return 0;
+    for (uint32_t i = 1; i < groups; ++i) {
+        if (map->anchors[i] <= map->anchors[i - 1]) return 0;
+    }
+    if (pages < (groups - 1) * READER_PAGEMAP_GROUP + 1) return 0;
+    map->groups = groups;
+    map->pages = pages;
+    map->truncated = 0;
+    return 1;
+}
+
+void reader_store_pagemap_save(const char *id, uint32_t geometry, uint32_t book_size,
+                               const reader_pagemap_t *map)
+{
+    if (!s_store_mounted || !valid_uploaded_id(id) || !map || !map->anchors) return;
+    // A truncated map would under-report what the reader can jump to, so it is
+    // never cached: the next open simply rebuilds.
+    if (map->truncated || map->groups == 0 || map->pages == 0) return;
+    cache_write_ex(id, 'p', geometry, book_size, map->pages, map->anchors,
+                   (size_t)map->groups * sizeof(uint32_t));
 }
 
 static void sanitize_name(const char *in, char *out)
@@ -249,23 +313,6 @@ static void sanitize_name(const char *in, char *out)
         used = 4;
     }
     memcpy(out + used, BOOK_EXT, sizeof(BOOK_EXT));
-}
-
-static bool books_partition_blank(void)
-{
-    const esp_partition_t *part = esp_partition_find_first(
-        ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_DATA_SPIFFS, BOOKS_LABEL);
-    if (!part) return false;
-    uint8_t block[512];
-    for (size_t offset = 0; offset < part->size; offset += sizeof(block)) {
-        size_t n = part->size - offset;
-        if (n > sizeof(block)) n = sizeof(block);
-        if (esp_partition_read(part, offset, block, n) != ESP_OK) return false;
-        for (size_t i = 0; i < n; ++i) {
-            if (block[i] != 0xff) return false;
-        }
-    }
-    return true;
 }
 
 static bool recover_replacement(void)
@@ -318,20 +365,33 @@ esp_err_t reader_store_init(void)
     lock_init();
     esp_err_t err;
 
-    esp_vfs_spiffs_conf_t conf = {
+    esp_vfs_littlefs_conf_t conf = {
         .base_path = BOOKS_BASE,
         .partition_label = BOOKS_LABEL,
-        .max_files = 4,
         .format_if_mount_failed = false,
+        // A later partition-table change can make the books partition larger;
+        // LittleFS then extends into the new blocks on mount instead of asking
+        // for a reformat, so an existing library survives a layout grown.
+        .grow_on_mount = true,
     };
-    err = esp_vfs_spiffs_register(&conf);
-    if (err == ESP_FAIL && books_partition_blank()) {
+    err = esp_vfs_littlefs_register(&conf);
+    // A failed mount means LittleFS found no filesystem it can use, so no code
+    // path in the firmware can read a byte of a book in that state: formatting
+    // destroys nothing still reachable, and it is the only recovery that keeps
+    // the device usable. Without a store, reader_store_init() fails, main.c
+    // returns, and the screen stays dead. A partition-table change that MOVES
+    // the books partition leaves stale image data inside the new bounds, which
+    // a "is the partition blank" probe cannot detect, so refusing to format
+    // here would brick the UI. Failures that are not "no filesystem" (out of
+    // memory, missing partition, bad arguments) do not return ESP_FAIL.
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "书籍分区没有可挂载的文件系统，重新格式化");
         conf.format_if_mount_failed = true;
-        err = esp_vfs_spiffs_register(&conf);
+        err = esp_vfs_littlefs_register(&conf);
     }
-    s_spiffs_mounted = err == ESP_OK;
-    if (!s_spiffs_mounted) {
-        ESP_LOGE(TAG, "SPIFFS 挂载失败: %s", esp_err_to_name(err));
+    s_store_mounted = err == ESP_OK;
+    if (!s_store_mounted) {
+        ESP_LOGE(TAG, "书籍分区挂载失败: %s", esp_err_to_name(err));
     } else if (recover_replacement()) {
         char stale[READER_BOOK_ID_MAX + 16];
         tmp_path(stale, sizeof(stale));
@@ -355,6 +415,8 @@ esp_err_t reader_store_init(void)
     load_progress();
     bookmarks_load_locked();
 
+
+
     size_t total = 0, used = 0;
     if (reader_store_space(&total, &used, NULL) == ESP_OK) {
         ESP_LOGI(TAG, "书籍分区: 总计 %u B, 已用 %u B", (unsigned)total, (unsigned)used);
@@ -364,9 +426,9 @@ esp_err_t reader_store_init(void)
 
 esp_err_t reader_store_space(size_t *total, size_t *used, size_t *free_bytes)
 {
-    if (!s_spiffs_mounted) return ESP_ERR_INVALID_STATE;
+    if (!s_store_mounted) return ESP_ERR_INVALID_STATE;
     size_t t = 0, u = 0;
-    esp_err_t err = esp_spiffs_info(BOOKS_LABEL, &t, &u);
+    esp_err_t err = esp_littlefs_info(BOOKS_LABEL, &t, &u);
     if (err != ESP_OK) return err;
     if (total) *total = t;
     if (used) *used = u;
@@ -394,7 +456,7 @@ int reader_store_list(reader_book_info_t *out, int max)
         b->builtin = true;
     }
 
-    if (!s_spiffs_mounted) return count;
+    if (!s_store_mounted) return count;
     DIR *dir = opendir(BOOKS_BASE);
     if (!dir) return count;
     struct dirent *ent;
@@ -425,8 +487,15 @@ int reader_store_list(reader_book_info_t *out, int max)
         reader_book_info_t *b = &out[count++];
         snprintf(b->id, sizeof(b->id), "%.*s",
                  (int)(sizeof(b->id) - 1), name);
-        snprintf(b->title, sizeof(b->title), "%.*s",
-                 (int)(nlen - 4), name);  // display without .zdx
+        const char *id_for_title = b->id;
+        // Show the NAME, not the storage id. Uploads store the browser's file
+        // name; older books only have the id, whose "~%08lx" uniqueness hash is
+        // stripped before display.
+        if (cache_read(id_for_title, 'n', 0, 0, b->title, sizeof(b->title)) == 0) {
+            reader_storage_display_title(name, b->title, sizeof(b->title));
+        } else {
+            b->title[sizeof(b->title) - 1] = '\0';
+        }
         b->size = (uint32_t)st.st_size;
         b->orig_size = orig_size;
         b->builtin = false;
@@ -479,7 +548,7 @@ esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out,
     if (!z) return ESP_ERR_NOT_FOUND;
     uint32_t total = z->original_size;
     uint32_t file_size = (uint32_t)z->file_size;
-    bool cacheable = s_spiffs_mounted && valid_uploaded_id(id);
+    bool cacheable = s_store_mounted && valid_uploaded_id(id);
     if (cacheable && cache_read(id, 'i', total, file_size, out, sizeof(*out)) == sizeof(*out) &&
         out->count > 0 && out->count <= READER_MAX_CHAPTERS) return ESP_OK;
 
@@ -526,7 +595,7 @@ esp_err_t reader_store_build_index(const char *id, reader_book_index_t *out,
 
 esp_err_t reader_store_begin_upload(const char *name, char *out_id, size_t out_id_size)
 {
-    if (!name || !out_id || out_id_size < 8 || !s_spiffs_mounted) {
+    if (!name || !out_id || out_id_size < 8 || !s_store_mounted) {
         return ESP_ERR_INVALID_ARG;
     }
     if (!s_upload_lock) return ESP_ERR_INVALID_STATE;
@@ -538,6 +607,7 @@ esp_err_t reader_store_begin_upload(const char *name, char *out_id, size_t out_i
 
     char base[READER_BOOK_ID_MAX];
     sanitize_name(name, base);
+    reader_storage_clean_title(name, s_upload_title, sizeof(s_upload_title));
     if (strlen(base) >= out_id_size || !recover_replacement()) {
         xSemaphoreGive(s_upload_lock);
         return ESP_FAIL;
@@ -709,12 +779,25 @@ esp_err_t reader_store_finish_upload(const char *id, reader_charset_report_t *co
     }
     zdx_cache_close();  // invalidate any decoder pointing at the old file
     esp_err_t err = cache_invalidate(id, 'i') && cache_invalidate(id, 'h') &&
-                    commit_upload(tmp, dst, id) ? ESP_OK : ESP_FAIL;
+                    cache_invalidate(id, 'p') && cache_invalidate(id, 'n') &&
+                    commit_upload(tmp, dst, id)
+                        ? ESP_OK : ESP_FAIL;
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "保存上传书籍失败: %s", dst);
         remove(tmp);
+        s_upload_title[0] = '\0';
     } else {
-        ESP_LOGI(TAG, "已保存 %s (%u 个未覆盖字符)", id, (unsigned)coverage.unsupported);
+        // The title is stored NEXT TO the book (cache kind 'n'): the on-flash
+        // name is an id that may be truncated and hashed, and the shelf must
+        // show the file name the reader actually chose.
+        if (s_upload_title[0]) {
+            cache_write(id, 'n', 0, 0, s_upload_title, strlen(s_upload_title) + 1);
+            ESP_LOGI(TAG, "已保存 %s as 《%s》 (%u 个未覆盖字符)", id, s_upload_title,
+                     (unsigned)coverage.unsupported);
+        } else {
+            ESP_LOGI(TAG, "已保存 %s (%u 个未覆盖字符)", id, (unsigned)coverage.unsupported);
+        }
+        s_upload_title[0] = '\0';
     }
     if (coverage_out) *coverage_out = coverage;
     xSemaphoreGive(s_upload_lock);
@@ -738,13 +821,15 @@ void reader_store_abort_upload(void)
 
 esp_err_t reader_store_delete(const char *id)
 {
-    if (!valid_uploaded_id(id) || !s_spiffs_mounted) return ESP_ERR_INVALID_ARG;
+    if (!valid_uploaded_id(id) || !s_store_mounted) return ESP_ERR_INVALID_ARG;
     if (s_zdx_open && strcmp(s_zdx_id, id) == 0) zdx_cache_close();
     char path[READER_BOOK_ID_MAX + 16];
     book_path(id, path, sizeof(path));
     if (remove(path) != 0) return ESP_ERR_NOT_FOUND;
     (void)cache_invalidate(id, 'i');
     (void)cache_invalidate(id, 'h');
+    (void)cache_invalidate(id, 'p');
+    (void)cache_invalidate(id, 'n');
     return ESP_OK;
 }
 

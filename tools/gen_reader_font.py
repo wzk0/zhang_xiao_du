@@ -128,7 +128,11 @@ HARMONIZE_MIN_SIZE = 16
 STROKE_CORE_THRESHOLD = 200
 # 12 px is the smallest size at which 2-bit CJK glyphs stay readable; 20 px is
 # the largest that still fits a comfortable page on the 240x320 panel.
-SIZES = tuple(range(12, 21))
+# Selectable body sizes. 17 px and 19 px are dropped: both are deterministic
+# upscales of the 16 px strike that sat between the cleaner 18 px and 20 px, and
+# each cost ~180-215 KiB of Flash the book store needs more. reader_layout.h
+# carries the same list for the firmware.
+SIZES = (12, 13, 14, 15, 16, 18, 20)
 EXTRA_LEADING = 4  # line_height = size + EXTRA_LEADING, a layout parameter
 
 # Chinese punctuation and UI symbols. U+3000 (ideographic space) must be a real

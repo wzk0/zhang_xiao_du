@@ -352,7 +352,7 @@ static esp_err_t send_upload_offset(httpd_req_t *req)
     if (s_upload.saved) {
         char escaped[READER_BOOK_ID_MAX * 3];
         json_escape(s_upload.id, escaped, sizeof(escaped));
-        // IDs are bounded by the SPIFFS name limit and at most eight samples
+        // IDs are bounded by the stored-name limit and at most eight samples
         // follow. Even with unsigned decimal code points they fit in body.
         size_t used = (size_t)snprintf(body, sizeof(body),
                  "{\"ok\":true,\"done\":true,\"offset\":%u,\"name\":\"%s\","

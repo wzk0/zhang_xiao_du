@@ -5,10 +5,10 @@
 
 #include <stddef.h>
 
-extern const unsigned char g_builtin_zdx_guide[2314];
+extern const unsigned char g_builtin_zdx_guide[2228];
 #define READER_ZDX_GUIDE_ORIG_SIZE 4288u
 #define READER_ZDX_GUIDE_TEXT_CHARS 1454u
-extern const unsigned char g_builtin_zdx_ginga[45040];
+extern const unsigned char g_builtin_zdx_ginga[40327];
 #define READER_ZDX_GINGA_ORIG_SIZE 81117u
 #define READER_ZDX_GINGA_TEXT_CHARS 26658u
 

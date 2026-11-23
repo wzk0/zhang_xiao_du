@@ -2,7 +2,7 @@
 //
 // The device opens an open (no password) 2.4 GHz AP, answers DNS queries with
 // its own address, and serves a small HTTP page at http://192.168.4.1. The phone
-// converts a .txt file to .zdx; chunks are written into the SPIFFS books
+// converts a .txt file to .zdx; chunks are written into the LittleFS books
 // partition. All slow work happens in the Wi-Fi/HTTP tasks. Nothing here touches
 // LVGL: the transfer screen polls reader_transfer_get_status() from its own
 // lv_timer inside the LVGL task.

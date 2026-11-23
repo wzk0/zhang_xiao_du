@@ -12,6 +12,7 @@
 #include "lvgl.h"
 #include "builtin_books.h"
 #include "reader_layout.h"
+#include "reader_pagemap.h"
 #include "reader_progress.h"
 #include "reader_storage.h"
 #include "reader_store.h"
@@ -22,6 +23,7 @@
 
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static const char *TAG = "reader_app";
@@ -34,10 +36,19 @@ static const char *TAG = "reader_app";
 #define PAGE_TEXT_SIZE    READER_LAYOUT_MAX_PAGE_BYTES
 #define HISTORY_DEPTH     READER_PAGE_HISTORY_MAX
 #define TICK_PERIOD_MS    1000
-#define AUTO_PAGE_MS      4000
+// Interval used until the reader picks one in 设置 → 自动翻页.
+#define AUTO_PAGE_DEFAULT 10
+// Hold-to-scroll repeat period. 60 ms is ~16 rows/s: enough to cross a few
+// hundred page ranges, slow enough that the full-screen redraw per step keeps up
+// on the 80 MHz display bus.
+#define SCROLL_PERIOD_MS  60
 #define LONG_IGNORE_MS    400
 #define BATTERY_TICKS     30
 #define PERSIST_EVERY     5
+// Anchors kept for the page map: 8 KiB of heap covers 20,480 pages, which is
+// far beyond any book that fits the books partition. Past that the page COUNT
+// stays exact and only the page-index lookups stop, which the log records.
+#define PAGEMAP_ANCHOR_BUDGET 2048u
 
 _Static_assert(PAGE_WINDOW_SIZE >= READER_LAYOUT_MAX_PAGE_BYTES,
                "one full page must fit inside a single read window");
@@ -68,6 +79,9 @@ typedef struct {
     size_t book_chars;
     uint32_t page_offset;
     uint32_t next_offset;
+    // 1-based page number of page_offset under the CURRENT geometry. Derived,
+    // never persisted: a page index means nothing after a font-size change.
+    uint32_t page_no;
     char page_text[PAGE_TEXT_SIZE];
     reader_book_index_t index;
     int chapter;
@@ -76,6 +90,9 @@ typedef struct {
     int setting_selected;
     int font_size;
     int backlight;
+    // Auto page-turn interval in seconds; 0 = off. Persisted, and the reading
+    // session's live on/off state lives in s_auto_mode.
+    int auto_seconds;
     int idle_seconds;
     int dark;
     int immersive;
@@ -100,6 +117,12 @@ typedef struct {
     uint32_t confirm_offset;
     // Hotspot page returns to the screen it was opened from (settings or shelf).
     int transfer_from;
+
+    // Page map: total page count plus one byte anchor every
+    // READER_PAGEMAP_GROUP pages. Rebuilt whenever the line geometry changes
+    // and freed when no book is open.
+    reader_pagemap_t pagemap;
+    uint32_t *pagemap_anchors;
 } reader_app_state_t;
 
 static reader_app_state_t s_state;
@@ -113,6 +136,10 @@ static int s_history_count;
 static QueueHandle_t s_queue;
 static TaskHandle_t s_task;
 static lv_timer_t *s_tick_timer;
+// Fast scrolling for the long TOC lists. Holding UP/DOWN starts it; releasing
+// the key (or any other key event) stops it.
+static lv_timer_t *s_scroll_timer;
+static int s_scroll_dir;
 static bool s_ready;
 static volatile uint32_t s_last_activity_ms;
 static int s_dim_stage;
@@ -198,6 +225,12 @@ static int paginate(const char *text, size_t len, size_t start,
                                reader_ascii_advance[font], out, out_size, page);
 }
 
+// Both are defined further down; prepare_page() keeps the page number current
+// and the page-map pass reports through the same overlay the first open uses.
+static void show_loading_progress(const char *phase, size_t done, size_t total);
+static void update_page_number(void);
+static uint32_t history_layout_key(void);
+
 static void prepare_page(void)
 {
     char window[PAGE_WINDOW_SIZE];
@@ -226,11 +259,119 @@ static void prepare_page(void)
         if (s_state.index.items[i].offset <= s_state.page_offset) best = i;
     }
     s_state.chapter = best;
+    update_page_number();
 }
 
+// One page step for the page map: same read window and same paginator the
+// screen uses, so the map can never disagree with what is drawn.
+//
+// The buffers are static, not stack: this is called up to GROUP-1 times per page
+// number lookup, sometimes from inside prepare_page(), and the input task has
+// only 6 KiB. Two ~1 KiB frames nested there is exactly the shape that used to
+// panic this device (see prev_chapter_last_page). Only one reader instance
+// exists and every caller runs on the input task, so the buffers cannot be in
+// use twice at once.
+static char s_pagemap_window[PAGE_WINDOW_SIZE];
+static char s_pagemap_out[PAGE_TEXT_SIZE];
+
+static int page_next_cb(void *ctx, uint32_t offset, uint32_t *next)
+{
+    (void)ctx;
+    if (!s_state.current_id[0] || !next) return 0;
+    int n = reader_store_read(s_state.current_id, offset, s_pagemap_window,
+                              sizeof(s_pagemap_window));
+    if (n <= 0) return 0;
+    char *out = s_pagemap_out;
+    reader_page_t page;
+    if (paginate(s_pagemap_window, (size_t)n, 0, out, sizeof(s_pagemap_out),
+                 &page) != 0) return 0;
+    if (page.next == 0) return 0;
+    uint32_t nxt = offset + (uint32_t)page.next;
+    if (nxt <= offset || nxt > s_state.book_size) return 0;
+    *next = nxt;
+    return 1;
+}
+
+static uint32_t s_pagemap_steps;
+
+static void pagemap_progress_cb(void *ctx, uint32_t done, uint32_t total)
+{
+    show_loading_progress((const char *)ctx, done, total);
+    // A whole-book pass on a multi-megabyte novel is seconds of CPU on a single
+    // core: yield often enough that IDLE still feeds the task watchdog.
+    if ((++s_pagemap_steps & 63u) == 0) vTaskDelay(1);
+}
+
+static void pagemap_free(void)
+{
+    free(s_state.pagemap_anchors);
+    s_state.pagemap_anchors = NULL;
+    reader_pagemap_init(&s_state.pagemap, NULL, 0);
+    s_state.page_no = 0;
+}
+
+// (Re)build the page map for the geometry that is active NOW. `phase` is the
+// caption shown in the progress overlay ("正在统计页数" / "正在重排").
+static void pagemap_rebuild(const char *phase)
+{
+    if (!s_state.current_id[0] || s_state.book_size == 0) {
+        reader_pagemap_init(&s_state.pagemap, NULL, 0);
+        s_state.page_no = 0;
+        return;
+    }
+    if (!s_state.pagemap_anchors) {
+        s_state.pagemap_anchors = malloc(PAGEMAP_ANCHOR_BUDGET * sizeof(uint32_t));
+        if (!s_state.pagemap_anchors) {
+            ESP_LOGW(TAG, "页数索引分配失败，页脚只显示百分比");
+        }
+    }
+    reader_pagemap_init(&s_state.pagemap, s_state.pagemap_anchors,
+                        s_state.pagemap_anchors ? PAGEMAP_ANCHOR_BUDGET : 0);
+    // Pages depend only on the pagination geometry, so an unchanged font size
+    // and mode reuse the previous result instead of re-reading the whole book.
+    // That is the difference between "opens at once" and "spins for a second".
+    if (reader_store_pagemap_load(s_state.current_id, history_layout_key(),
+                                  s_state.book_size, &s_state.pagemap)) {
+        s_state.page_no = reader_pagemap_page_at(&s_state.pagemap, page_next_cb, NULL,
+                                                 s_state.page_offset);
+        ESP_LOGI(TAG, "页数缓存命中: 共 %u 页，当前第 %u 页",
+                 (unsigned)s_state.pagemap.pages, (unsigned)s_state.page_no);
+        return;
+    }
+    s_pagemap_steps = 0;
+    reader_pagemap_build(&s_state.pagemap, page_next_cb, NULL, s_state.book_size,
+                         pagemap_progress_cb, (void *)phase);
+    if (s_state.pagemap_anchors && s_state.pagemap.truncated) {
+        ESP_LOGW(TAG, "页数索引已满（%u 页之后只计页数，不再支持按页跳转）",
+                 (unsigned)(s_state.pagemap.groups * READER_PAGEMAP_GROUP));
+    }
+    s_state.page_no = reader_pagemap_page_at(&s_state.pagemap, page_next_cb, NULL,
+                                             s_state.page_offset);
+    // Cache it for the next open. Built-in books have no writable id, so the
+    // save is a no-op for them (they are small enough to re-page instantly).
+    reader_store_pagemap_save(s_state.current_id, history_layout_key(),
+                              s_state.book_size, &s_state.pagemap);
+    ESP_LOGI(TAG, "页数: 共 %u 页，当前第 %u 页", (unsigned)s_state.pagemap.pages,
+             (unsigned)s_state.page_no);
+}
+
+static void update_page_number(void)
+{
+    if (s_state.pagemap.pages == 0 || !s_state.pagemap_anchors) {
+        s_state.page_no = 0;
+        return;
+    }
+    s_state.page_no = reader_pagemap_page_at(&s_state.pagemap, page_next_cb, NULL,
+                                             s_state.page_offset);
+}
+
+// Identity of one pagination geometry. Both caches that survive a reboot are
+// keyed by it: the back-history and the page map (see reader_store_pagemap_save).
+// Bump the high bits whenever reader_text.c or reader_layout.c changes how pages
+// are laid out, otherwise a book reopened after a firmware update keeps page
+// numbers and bookmarks computed with the old rules.
 static uint32_t history_layout_key(void)
 {
-    // Bump the high bits when pagination rules change.
     return 0x10000u | ((uint32_t)s_state.font_size << 1) | (s_state.immersive != 0);
 }
 
@@ -342,20 +483,30 @@ static void render_screen_locked(void)
         reader_ui_render_reader(
             s_state.current_title, chapter_title(),
             s_state.page_text, s_state.font_size,
-            read_percent(), battery, s_auto_mode, s_state.immersive);
+            read_percent(), (int)s_state.page_no, (int)s_state.pagemap.pages,
+            battery, s_auto_mode, s_state.immersive);
         break;
     case READER_SCREEN_TOC:
         reader_ui_render_toc(&s_state.index, s_state.bookmark_count,
-                             s_state.bookmark_title_ptrs, s_state.toc_mode,
-                             s_state.toc_focus, s_state.toc_selected, battery);
+                             s_state.bookmark_title_ptrs,
+                             (int)s_state.pagemap.groups, (int)s_state.pagemap.pages,
+                             s_state.toc_mode, s_state.toc_focus,
+                             s_state.toc_selected, battery);
         break;
     case READER_SCREEN_SETTINGS:
         reader_ui_render_settings(s_state.setting_selected, s_state.font_size,
-                                  s_state.backlight, s_state.idle_seconds,
-                                  s_state.dark, s_state.immersive, battery);
+                                  s_state.backlight, s_state.auto_seconds,
+                                  s_state.idle_seconds, s_state.dark,
+                                  s_state.immersive, battery);
         break;
     case READER_SCREEN_FONT_PICKER:
         reader_ui_render_font_picker(s_state.font_size, battery);
+        break;
+    case READER_SCREEN_BACKLIGHT:
+        reader_ui_render_backlight_picker(s_state.backlight, battery);
+        break;
+    case READER_SCREEN_AUTOPAGE:
+        reader_ui_render_autopage_picker(s_state.auto_seconds, battery);
         break;
     case READER_SCREEN_TRANSFER:
         reader_transfer_get_status(&status);
@@ -419,6 +570,18 @@ static void show_loading_progress(const char *phase, size_t done, size_t total)
     reader_ui_update_loading(s_state.current_title, phase, percent);
     bsp_lvgl_unlock();
     s_loading_updated = now;
+}
+
+// Show the overlay immediately at 0 % and restart the throttle window, so work
+// that begins on a settled screen (a font-size change) never leaves a frozen
+// page behind while the book is re-paginated.
+static void begin_progress(const char *phase)
+{
+    s_loading_started = now_ms();
+    s_loading_updated = s_loading_started;
+    if (!bsp_lvgl_lock(100)) return;
+    reader_ui_update_loading(s_state.current_title, phase, 0);
+    bsp_lvgl_unlock();
 }
 
 static void index_loading_progress(size_t done, size_t total, void *ctx)
@@ -607,6 +770,13 @@ static void open_book(int list_index)
         rebuild_history_walk(chapter_start_offset(s_state.chapter), s_state.page_offset, true);
         save_resume_history();
     }
+    // Page numbers exist only under a geometry: count them in the same loading
+    // pass as the index, so the footer and the TOC page tab are ready the moment
+    // the page appears.
+    pagemap_rebuild("正在统计页数");
+    // Every session starts manual: the key toggles auto page-turning on demand.
+    s_auto_mode = 0;
+    s_auto_elapsed_ms = 0;
     s_state.screen = first_open ? READER_SCREEN_COVER : READER_SCREEN_READER;
     note_activity();
     atomic_store(&s_loading, false);
@@ -620,6 +790,11 @@ static void close_book(void)
     }
     s_state.current_id[0] = '\0';
     s_auto_mode = 0;
+    // Pages are a property of an open book: never let the shelf or a later book
+    // display the previous one's count.
+    reader_pagemap_init(&s_state.pagemap, s_state.pagemap_anchors,
+                        s_state.pagemap_anchors ? PAGEMAP_ANCHOR_BUDGET : 0);
+    s_state.page_no = 0;
     s_state.screen = READER_SCREEN_LIBRARY;
     refresh_book_list();
 }
@@ -668,6 +843,31 @@ static void goto_chapter(int index)
     s_state.toc_selected = index;
     history_reset();
     prepare_page();
+    persist_progress();
+    s_state.screen = READER_SCREEN_READER;
+}
+
+// Jump to the first page of a 10-page range picked in the TOC page tab. This
+// exists because chapter detection is heuristic: when a book's headings are
+// missing or wrong, a page range is still a dependable place to land.
+static void goto_page_group(int group)
+{
+    if (group < 0 || (uint32_t)group >= s_state.pagemap.groups) return;
+    const uint32_t page = (uint32_t)group * READER_PAGEMAP_GROUP + 1;
+    uint32_t offset = 0;
+    if (!reader_pagemap_offset_of(&s_state.pagemap, page_next_cb, NULL, page, &offset)) return;
+    if (offset >= s_state.book_size) return;
+
+    s_state.page_offset = offset;
+    // Land in the chapter that owns this page so the header subtitle is right.
+    int best = 0;
+    for (int i = 0; i < s_state.index.count; ++i) {
+        if (s_state.index.items[i].offset <= offset) best = i;
+    }
+    s_state.chapter = best;
+    s_state.toc_selected = s_state.chapter;
+    prepare_page();
+    rebuild_history(chapter_start_offset(s_state.chapter), offset);
     persist_progress();
     s_state.screen = READER_SCREEN_READER;
 }
@@ -897,7 +1097,25 @@ static void reflow_current_page(void)
 static void commit_font_size(void)
 {
     reader_store_set_setting("font", (uint8_t)s_state.font_size);
+    if (!s_state.current_id[0]) return;
+
+    // Every page boundary moves, so both the current page and the book's page
+    // count have to be recomputed. On a multi-megabyte book that is seconds of
+    // work: show the same progress overlay the first open uses instead of
+    // leaving a frozen screen behind.
+    begin_progress("正在重排");
     reflow_current_page();
+    pagemap_rebuild("正在重排");
+}
+
+// Persist the ruler pages on the way out instead of on every step, so scrubbing
+// across eleven brightness values is one NVS write, not eleven.
+static void commit_ruler_setting(void)
+{
+    reader_store_set_setting("bl", (uint8_t)s_state.backlight);
+    reader_store_set_setting("auto", (uint8_t)s_state.auto_seconds);
+    // A new interval restarts the countdown rather than inheriting the old one.
+    s_auto_elapsed_ms = 0;
 }
 
 static void cycle_setting(int row)
@@ -913,22 +1131,27 @@ static void cycle_setting(int row)
         s_state.screen = READER_SCREEN_FONT_PICKER;
         break;
     case 2:
-        s_state.backlight += 25;
-        if (s_state.backlight > 100) s_state.backlight = 25;
-        reader_store_set_setting("bl", (uint8_t)s_state.backlight);
-        bsp_display_backlight((uint8_t)s_state.backlight);
-        s_dim_stage = 0;
+        // Brightness gets its own ruler page, exactly like the font size: the
+        // old "cycle in place" row made picking 40 % a four-press job with no
+        // feedback until you left the settings.
+        s_state.backlight = (int)s_state.backlight;
+        s_state.screen = READER_SCREEN_BACKLIGHT;
         break;
     case 3:
+        // Auto page-turn interval. Its page also explains the reading-screen
+        // shortcut, because that is where a reader would look for it.
+        s_state.screen = READER_SCREEN_AUTOPAGE;
+        break;
+    case 4:
         s_state.idle_seconds = s_state.idle_seconds == 30 ? 60 :
                                s_state.idle_seconds == 60 ? 120 : 30;
         reader_store_set_setting("idle", (uint8_t)s_state.idle_seconds);
         break;
-    case 4:
+    case 5:
         s_state.dark = !s_state.dark;
         reader_store_set_setting("dark", (uint8_t)s_state.dark);
         break;
-    case 5:
+    case 6:
         s_state.immersive = !s_state.immersive;
         reader_store_set_setting("immerse", (uint8_t)s_state.immersive);
         // The line budget just changed, so the text currently in page_text was
@@ -936,9 +1159,13 @@ static void cycle_setting(int row)
         // the top sentence does not move, the page just shows more (or fewer)
         // lines, and a bookmark taken afterwards points at the visible text.
         repaginate_in_place();
+        if (s_state.current_id[0]) {
+            begin_progress("正在重排");
+            pagemap_rebuild("正在重排");
+        }
         break;
-    case 6:
-        // Storage is a read-only sub-page; it queries SPIFFS when rendered.
+    case 7:
+        // Storage is a read-only sub-page; it queries the filesystem when rendered.
         s_state.screen = READER_SCREEN_STORAGE;
         break;
     default:
@@ -946,15 +1173,77 @@ static void cycle_setting(int row)
     }
 }
 
+// Where a TOC list must start when its tab is entered. The point of the tab row
+// is "take me to where I am", so every tab opens on the reader's own position
+// instead of row 0: the chapter being read, the nearest bookmark at or before
+// this page, or the 10-page range that contains it. Starting at 0 forced a
+// scroll from the beginning of the book every single time.
+static void toc_select_current(void)
+{
+    switch (s_state.toc_mode) {
+    case 0:
+        s_state.toc_selected = s_state.chapter;
+        if (s_state.toc_selected >= s_state.index.count) {
+            s_state.toc_selected = s_state.index.count > 0 ? s_state.index.count - 1 : 0;
+        }
+        if (s_state.toc_selected < 0) s_state.toc_selected = 0;
+        break;
+    case 1: {
+        // Bookmarks are byte offsets, so "nearest" is the greatest offset at or
+        // before the current page. No earlier bookmark means the first one.
+        int best = -1;
+        uint32_t best_offset = 0;
+        for (int i = 0; i < s_state.bookmark_count; ++i) {
+            const uint32_t offset = (uint32_t)s_state.bookmarks[i].offset;
+            if (offset <= s_state.page_offset &&
+                (best < 0 || offset >= best_offset)) {
+                best = i;
+                best_offset = offset;
+            }
+        }
+        if (best < 0 && s_state.bookmark_count > 0) {
+            // All bookmarks are ahead of the reader: start at the closest one.
+            best = 0;
+            for (int i = 1; i < s_state.bookmark_count; ++i) {
+                if ((uint32_t)s_state.bookmarks[i].offset <
+                    (uint32_t)s_state.bookmarks[best].offset) {
+                    best = i;
+                }
+            }
+        }
+        s_state.toc_selected = best >= 0 ? best : 0;
+        break;
+    }
+    default: {
+        uint32_t group = 0;
+        if (s_state.page_no > 0) {
+            group = (s_state.page_no - 1) / READER_PAGEMAP_GROUP;
+        }
+        const uint32_t groups = s_state.pagemap.groups;
+        if (groups > 0 && group >= groups) group = groups - 1;
+        s_state.toc_selected = groups > 0 ? (int)group : 0;
+        break;
+    }
+    }
+}
+
+// Begin hold-to-repeat on a ruler or a TOC list: one immediate step, then
+// SCROLL_PERIOD_MS repeats until the key is released.
+static void scroll_begin(int delta);
+
 static void move_selection(int delta)
 {
     int max = 0;
     switch (s_state.screen) {
     case READER_SCREEN_LIBRARY: max = s_state.book_count + 1; break;
     case READER_SCREEN_TOC:
-        max = s_state.toc_mode == 0 ? s_state.index.count : s_state.bookmark_count;
+        // Mode 2 lists page ranges, so its length is the number of 10-page
+        // groups the page map produced, not a chapter/bookmark count.
+        max = s_state.toc_mode == 0 ? s_state.index.count
+            : s_state.toc_mode == 1 ? s_state.bookmark_count
+                                    : (int)s_state.pagemap.groups;
         break;
-    case READER_SCREEN_SETTINGS: max = 7; break;
+    case READER_SCREEN_SETTINGS: max = 8; break;
     default: return;
     }
     int *sel = s_state.screen == READER_SCREEN_LIBRARY ? &s_state.selected :
@@ -971,14 +1260,88 @@ static void move_selection(int delta)
     *sel = next;
 }
 
-// UP grows the body text, DOWN shrinks it; both clamp instead of wrapping so
-// the ends of the range are obvious.
+// Every ruler wraps at both ends, so holding a direction never dead-ends.
+static int wrap_index(int index, int count)
+{
+    if (count <= 0) return 0;
+    index %= count;
+    if (index < 0) index += count;
+    return index;
+}
+
+// UP grows the body text, DOWN shrinks it, cycling through the selectable sizes.
+// Step by TABLE POSITION, not by pixel: 17 and 19 px are not selectable, so
+// `size + 1` would ask for a font that is not compiled in.
 static void step_font_size(int delta)
 {
-    int next = s_state.font_size + delta;
-    if (next < READER_FONT_MIN_SIZE) next = READER_FONT_MIN_SIZE;
-    if (next > READER_FONT_MAX_SIZE) next = READER_FONT_MAX_SIZE;
-    s_state.font_size = next;
+    int index = wrap_index(reader_layout_font_index(s_state.font_size) + delta,
+                           READER_FONT_SIZE_COUNT);
+    s_state.font_size = reader_layout_font_size(index);
+}
+
+// One step of whatever the three pickers and the TOC lists show. Short taps and
+// the held-key timer both go through here, so holding a key repeats exactly what
+// a single tap does — no second, subtly different fast path.
+static void scroll_step(int delta)
+{
+    switch (s_state.screen) {
+    case READER_SCREEN_TOC:
+        if (s_state.toc_focus != 1) {
+            s_scroll_dir = 0;
+            return;
+        }
+        move_selection(delta);
+        return;
+    case READER_SCREEN_FONT_PICKER:
+        step_font_size(delta);
+        return;
+    case READER_SCREEN_BACKLIGHT:
+        s_state.backlight = reader_backlight_step_value(
+            wrap_index(reader_backlight_step_index(s_state.backlight) + delta,
+                       READER_BACKLIGHT_STEPS));
+        bsp_display_backlight((uint8_t)s_state.backlight);
+        s_dim_stage = 0;
+        return;
+    case READER_SCREEN_AUTOPAGE:
+        s_state.auto_seconds = reader_autopage_option(
+            wrap_index(reader_autopage_index(s_state.auto_seconds) + delta,
+                       READER_AUTOPAGE_OPTIONS));
+        return;
+    default:
+        s_scroll_dir = 0;
+        return;
+    }
+}
+
+static void scroll_begin(int delta)
+{
+    if (!delta) return;
+    s_scroll_dir = delta > 0 ? 1 : -1;
+    scroll_step(s_scroll_dir);
+}
+
+// Runs inside the LVGL task, so it may draw directly. Any release stops it, and
+// scroll_step() clears the direction if the screen moved on underneath.
+static void scroll_tick(lv_timer_t *timer)
+{
+    (void)timer;
+    if (s_scroll_dir == 0) return;
+    scroll_step(s_scroll_dir);
+    render_screen_locked();
+}
+
+// Toggle auto page-turning from the reading screen. Bound to a double tap for
+// now: the hardware "power" key is not wired to the MCU (bsp_pins.h has only the
+// three ADC keys), and every single-tap gesture on this screen is already taken
+// by paging / 目录 / 书签 / 设置 / 退出. A double tap is free because iot_button
+// emits BUTTON_SINGLE_CLICK only after the double-click window expires, so a
+// double tap never reaches the paging branch first.
+static void toggle_auto_page(void)
+{
+    s_auto_mode = s_auto_mode ? 0 : 1;
+    s_auto_elapsed_ms = 0;
+    note_activity();
+    set_hint(s_auto_mode ? "自动翻页 开" : "自动翻页 关");
 }
 
 static bool is_short(int event)
@@ -992,9 +1355,16 @@ static void process_key(const input_event_t *in)
 {
     note_activity();
     int64_t now_us = esp_timer_get_time();
-    if (in->event == BSP_BTN_PRESS || in->event == BSP_BTN_RELEASE) {
+    if (in->event == BSP_BTN_RELEASE) {
+        s_scroll_dir = 0;  // the held key is up: stop the fast scroll
+        return;
+    }
+    if (in->event == BSP_BTN_PRESS) {
         return;  // wake only
     }
+    // Any new key event ends a previous hold before it is interpreted, so a
+    // stale direction can never keep moving the list behind the user's back.
+    s_scroll_dir = 0;
 
     const bool is_long = in->event == BSP_BTN_LONG;
     if (!is_long && now_us < s_ignore_until_us) return;  // suppress post-long click
@@ -1030,14 +1400,20 @@ static void process_key(const input_event_t *in)
             break;
         case READER_SCREEN_TOC:
             if (in->btn == BSP_BTN_OK) {
-                // OK-long is the explicit "return" from the whole TOC page.
-                s_state.screen = READER_SCREEN_READER;
-            } else if (s_state.toc_mode == 1 && s_state.toc_focus == 1 &&
-                       (in->btn == BSP_BTN_UP || in->btn == BSP_BTN_DOWN)) {
+                // Long OK is "back", one level per press: the list returns to the
+                // tab row, and the tab row leaves the TOC for the reading page.
+                if (s_state.toc_focus == 1) {
+                    s_state.toc_focus = 0;
+                } else {
+                    s_state.screen = READER_SCREEN_READER;
+                }
+            } else if (s_state.toc_mode == 1 && s_state.toc_focus == 1) {
+                // The bookmark list keeps its delete gesture, and a handful of
+                // bookmarks never needs fast scrolling.
                 request_delete_bookmark();
             } else if (s_state.toc_focus == 1) {
-                // Chapter list keeps the old "back to the tab row" behaviour.
-                s_state.toc_focus = 0;
+                // Chapter and page-range lists: hold UP/DOWN to scroll fast.
+                scroll_begin(in->btn == BSP_BTN_UP ? -1 : 1);
             } else {
                 s_state.screen = READER_SCREEN_READER;
             }
@@ -1059,10 +1435,25 @@ static void process_key(const input_event_t *in)
             }
             break;
         case READER_SCREEN_FONT_PICKER:
-            // Leaving the picker is the commit point: re-flow once instead of
-            // on every key press, which keeps the preview instant.
-            commit_font_size();
-            s_state.screen = READER_SCREEN_SETTINGS;
+            if (in->btn == BSP_BTN_OK) {
+                // Leaving the picker is the commit point: re-flow once instead
+                // of on every key press, which keeps the preview instant.
+                commit_font_size();
+                s_state.screen = READER_SCREEN_SETTINGS;
+            } else {
+                scroll_begin(in->btn == BSP_BTN_UP ? 1 : -1);
+            }
+            break;
+        case READER_SCREEN_BACKLIGHT:
+        case READER_SCREEN_AUTOPAGE:
+            if (in->btn == BSP_BTN_OK) {
+                commit_ruler_setting();
+                s_state.screen = READER_SCREEN_SETTINGS;
+            } else {
+                // Hold UP/DOWN to sweep the ladder: same repeat as the TOC page
+                // lists, and it wraps, so one long press reaches any value.
+                scroll_begin(in->btn == BSP_BTN_UP ? 1 : -1);
+            }
             break;
         case READER_SCREEN_FINISHED:
             // Only OK-long acts as the advertised "OK" exit. Holding UP/DOWN
@@ -1088,6 +1479,14 @@ static void process_key(const input_event_t *in)
         render_screen();
         return;
     }
+    // Auto page-turn toggle, checked before the click branches: see
+    // toggle_auto_page() for why a double tap is the available gesture.
+    if (in->event == BSP_BTN_DOUBLE && in->btn == BSP_BTN_OK &&
+        s_state.screen == READER_SCREEN_READER) {
+        toggle_auto_page();
+        render_screen();
+        return;
+    }
     if (!is_short(in->event)) return;
 
     const int btn = in->btn;
@@ -1099,9 +1498,10 @@ static void process_key(const input_event_t *in)
             break;
         case READER_SCREEN_TOC:
             if (s_state.toc_focus == 0) {
-                // Tab row: UP/DOWN flips between chapters and bookmarks.
-                s_state.toc_mode = s_state.toc_mode ? 0 : 1;
-                s_state.toc_selected = 0;
+                // Tab row: UP moves LEFT, DOWN moves RIGHT (wrapping at both
+                // ends), matching the left-to-right order of the three tabs.
+                s_state.toc_mode = (s_state.toc_mode + 2) % 3;
+                toc_select_current();
             } else {
                 move_selection(-1);
             }
@@ -1111,6 +1511,10 @@ static void process_key(const input_event_t *in)
             break;
         case READER_SCREEN_FONT_PICKER:
             step_font_size(1);
+            break;
+        case READER_SCREEN_BACKLIGHT:
+        case READER_SCREEN_AUTOPAGE:
+            scroll_step(1);
             break;
         case READER_SCREEN_FINISHED:
             // UP steps back to the last page rather than leaving the book: the
@@ -1134,8 +1538,9 @@ static void process_key(const input_event_t *in)
             break;
         case READER_SCREEN_TOC:
             if (s_state.toc_focus == 0) {
-                s_state.toc_mode = s_state.toc_mode ? 0 : 1;
-                s_state.toc_selected = 0;
+                // Tab row: UP/DOWN cycles chapters -> bookmarks -> pages.
+                s_state.toc_mode = (s_state.toc_mode + 1) % 3;
+                toc_select_current();
             } else {
                 move_selection(1);
             }
@@ -1151,6 +1556,10 @@ static void process_key(const input_event_t *in)
             break;
         case READER_SCREEN_FONT_PICKER:
             step_font_size(-1);
+            break;
+        case READER_SCREEN_BACKLIGHT:
+        case READER_SCREEN_AUTOPAGE:
+            scroll_step(-1);
             break;
         case READER_SCREEN_COVER:
             s_state.screen = READER_SCREEN_READER;
@@ -1189,11 +1598,13 @@ static void process_key(const input_event_t *in)
         case READER_SCREEN_TOC:
             if (s_state.toc_focus == 0) {
                 s_state.toc_focus = 1;
-                s_state.toc_selected = 0;
+                toc_select_current();
             } else if (s_state.toc_mode == 0) {
                 goto_chapter(s_state.toc_selected);
-            } else {
+            } else if (s_state.toc_mode == 1) {
                 goto_bookmark(s_state.toc_selected);
+            } else {
+                goto_page_group(s_state.toc_selected);
             }
             break;
         case READER_SCREEN_SETTINGS:
@@ -1203,6 +1614,11 @@ static void process_key(const input_event_t *in)
             // A tap on OK saves and returns, same as a long press: the two
             // would otherwise have to be explained in a one-line hint.
             commit_font_size();
+            s_state.screen = READER_SCREEN_SETTINGS;
+            break;
+        case READER_SCREEN_BACKLIGHT:
+        case READER_SCREEN_AUTOPAGE:
+            commit_ruler_setting();
             s_state.screen = READER_SCREEN_SETTINGS;
             break;
         case READER_SCREEN_TRANSFER:
@@ -1281,10 +1697,13 @@ static void tick(lv_timer_t *timer)
         return;
     }
 
-    // Auto page advance counts as activity, so the screen stays on.
+    // Auto page advance counts as activity, so the screen stays on. The interval
+    // comes from the 自动翻页 setting; a zero interval means the reader turned it
+    // off, and the timer must not keep a stale mode alive.
+    const uint32_t auto_ms = (uint32_t)s_state.auto_seconds * 1000u;
     if (s_auto_mode && s_state.screen == READER_SCREEN_READER) {
         s_auto_elapsed_ms += TICK_PERIOD_MS;
-        if (s_auto_elapsed_ms >= AUTO_PAGE_MS) {
+        if (s_auto_elapsed_ms >= auto_ms) {
             s_auto_elapsed_ms = 0;
             page_delta(1, 0);
             if (!s_auto_mode) persist_progress();
@@ -1314,8 +1733,12 @@ esp_err_t reader_app_init(bsp_btn_cb_t key_cb)
     if (!reader_layout_size_valid(s_state.font_size)) {
         s_state.font_size = READER_FONT_DEFAULT_SIZE;
     }
-    s_state.backlight = reader_store_get_setting("bl", 100);
-    if (s_state.backlight < 25 || s_state.backlight > 100) s_state.backlight = 100;
+    // Both ladders live in reader_ui (it draws them), so a value written by an
+    // older firmware snaps onto the current ladder instead of being rejected.
+    s_state.backlight = reader_backlight_step_value(
+        reader_backlight_step_index(reader_store_get_setting("bl", 100)));
+    s_state.auto_seconds = reader_autopage_option(
+        reader_autopage_index(reader_store_get_setting("auto", AUTO_PAGE_DEFAULT)));
     s_state.idle_seconds = reader_store_get_setting("idle", 60);
     if (s_state.idle_seconds != 30 && s_state.idle_seconds != 60 &&
         s_state.idle_seconds != 120) {
@@ -1335,6 +1758,7 @@ esp_err_t reader_app_init(bsp_btn_cb_t key_cb)
     }
     reader_ui_init();
     s_tick_timer = lv_timer_create(tick, TICK_PERIOD_MS, NULL);
+    s_scroll_timer = lv_timer_create(scroll_tick, SCROLL_PERIOD_MS, NULL);
     render_screen_locked();
     bsp_lvgl_unlock();
 
@@ -1367,13 +1791,17 @@ esp_err_t reader_app_init(bsp_btn_cb_t key_cb)
 void reader_app_deinit(void)
 {
     s_ready = false;
+    pagemap_free();
     reader_transfer_stop();
-    if (s_tick_timer) {
+    s_scroll_dir = 0;
+    if (s_tick_timer || s_scroll_timer) {
         if (bsp_lvgl_lock(1000)) {
-            lv_timer_delete(s_tick_timer);
-            reader_ui_deinit();  // stops the screen after its timer is gone
+            if (s_scroll_timer) lv_timer_delete(s_scroll_timer);
+            if (s_tick_timer) lv_timer_delete(s_tick_timer);
+            reader_ui_deinit();  // stops the screen after its timers are gone
             bsp_lvgl_unlock();
         }
+        s_scroll_timer = NULL;
         s_tick_timer = NULL;
     } else {
         reader_ui_deinit();

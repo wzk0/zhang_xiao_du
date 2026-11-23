@@ -1,4 +1,4 @@
-// reader_store.h — books in the SPIFFS "books" partition and progress in NVS.
+// reader_store.h — books in the LittleFS "books" partition and progress in NVS.
 //
 // Built-in sample books are compiled into Flash; uploaded books are files under
 // /books. The board has no PSRAM (largest free block is only a few KiB), so all
@@ -8,6 +8,7 @@
 
 #include "esp_err.h"
 #include "reader_bookmark.h"
+#include "reader_pagemap.h"
 #include "reader_text.h"
 
 #include <stdbool.h>
@@ -44,13 +45,24 @@ typedef struct {
     size_t char_count;
 } reader_book_index_t;
 
-// Mounts SPIFFS (formatting a blank partition on first boot) and opens NVS.
+// Mounts the books filesystem (formatting an unmountable partition) and opens NVS.
 // nvs_flash_init() must already have succeeded. Safe to call once at boot.
 esp_err_t reader_store_init(void);
 
 // Visible built-in books first (deleted samples are filtered out), then
 // uploaded files. Returns the number of books.
 int reader_store_list(reader_book_info_t *out, int max);
+
+// Page-map cache. A page map costs a full-book pagination pass, which is
+// noticeable on a multi-megabyte novel; it only depends on the pagination
+// geometry, so an unchanged geometry reuses the previous result. `geometry` is
+// the caller's layout key (font size + immersive + a rules version), `book_size`
+// the ORIGINAL byte length. Load returns 1 on a hit and fills `map`. Save
+// ignores truncated maps (they would under-report the jumpable range).
+int reader_store_pagemap_load(const char *id, uint32_t geometry, uint32_t book_size,
+                              reader_pagemap_t *map);
+void reader_store_pagemap_save(const char *id, uint32_t geometry, uint32_t book_size,
+                               const reader_pagemap_t *map);
 
 // Remaining storage space, in bytes. Used by the transfer page and web page.
 esp_err_t reader_store_space(size_t *total, size_t *used, size_t *free_bytes);

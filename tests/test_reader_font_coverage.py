@@ -41,6 +41,7 @@ ROOT = Path(__file__).resolve().parents[1]
 FONT_DIR = ROOT / "assets" / "fonts"
 CHARSET_FILE = FONT_DIR / "charset.txt"
 LAYOUT_HEADER = ROOT / "main" / "reader_layout.h"
+LAYOUT_SOURCE = ROOT / "main" / "reader_layout.c"
 CHARSET_HEADER = ROOT / "assets" / "fonts" / "reader_charset.h"
 STRING_LITERAL_RE = re.compile(r'"((?:\\.|[^"\\])*)"')
 ESCAPE_RE = re.compile(
@@ -51,21 +52,30 @@ NEGATIVE_CONTROL = 0x1F600  # emoji: deliberately outside the reader's inventory
 
 
 def font_sizes() -> tuple[int, ...]:
-    """Selectable body sizes, read from the header the firmware compiles.
+    """Selectable body sizes, read from the table the firmware compiles.
 
     Deriving the list here keeps this gate honest when a size is added or
     removed: a missing row shows up as a missing font file, not as a silently
-    untested size.
+    untested size. The sizes are no longer a contiguous range (17 px and 19 px
+    were dropped as upscaled duplicates), so the emitted table is the source of
+    truth and READER_FONT_SIZE_COUNT must agree with it.
     """
-    text = LAYOUT_HEADER.read_text(encoding="utf-8")
-    lo = re.search(r"#define READER_FONT_MIN_SIZE\s+(\d+)", text)
-    hi = re.search(r"#define READER_FONT_MAX_SIZE\s+(\d+)", text)
-    if not lo or not hi:
-        raise RuntimeError(f"{LAYOUT_HEADER.name}: cannot find the size range")
-    first, last = int(lo.group(1)), int(hi.group(1))
-    if first >= last:
-        raise RuntimeError(f"{LAYOUT_HEADER.name}: empty size range {first}..{last}")
-    return tuple(range(first, last + 1))
+    text = LAYOUT_SOURCE.read_text(encoding="utf-8")
+    table = re.search(r"g_reader_font_sizes\[[^\]]*\]\s*=\s*\{([^}]*)\}", text)
+    if not table:
+        raise RuntimeError(f"{LAYOUT_SOURCE.name}: cannot find g_reader_font_sizes")
+    sizes = tuple(int(value) for value in re.findall(r"\d+", table.group(1)))
+    header = LAYOUT_HEADER.read_text(encoding="utf-8")
+    count = re.search(r"#define READER_FONT_SIZE_COUNT\s+(\d+)", header)
+    if not count:
+        raise RuntimeError(f"{LAYOUT_HEADER.name}: cannot find READER_FONT_SIZE_COUNT")
+    if len(sizes) != int(count.group(1)):
+        raise RuntimeError(
+            f"{LAYOUT_SOURCE.name}: {len(sizes)} sizes but READER_FONT_SIZE_COUNT "
+            f"is {count.group(1)}")
+    if not sizes or list(sizes) != sorted(set(sizes)):
+        raise RuntimeError(f"{LAYOUT_SOURCE.name}: sizes must be unique and ascending")
+    return sizes
 
 
 def font_files(sizes: tuple[int, ...]) -> tuple[Path, ...]:
@@ -168,8 +178,8 @@ MIN_INK_RATIO = 0.90
 # Solid-ink counts for the native and expanded strikes.
 BASELINE_INK = {
     12: 219646, 13: 238924, 14: 259100,
-    15: 259484, 16: 309064, 17: 311803,
-    18: 333500, 19: 356543, 20: 370779,
+    15: 259484, 16: 309064,
+    18: 333500, 20: 370779,
 }
 
 
@@ -200,7 +210,7 @@ def check_glyph_contrast(path: Path) -> None:
         )
 
 
-def check_generator_contract() -> None:
+def check_generator_contract(sizes: tuple[int, ...]) -> None:
     """Pin the rasterisation strategy, not just the emitted bitmaps."""
     text = GENERATOR.read_text(encoding="utf-8")
     m = STROKE_CORE_THRESHOLD_RE.search(text)
@@ -245,7 +255,7 @@ def check_generator_contract() -> None:
         raise RuntimeError("tools/gen_reader_font.py: BITMAP_STRIKE_FOR_SIZE missing")
     pairs = dict((int(k), int(v)) for k, v in
                  re.findall(r"(\d+)\s*:\s*(\d+)", smap.group(1)))
-    for size in range(12, 21):
+    for size in sizes:
         if size not in pairs:
             raise RuntimeError(
                 f"tools/gen_reader_font.py: {size}px has no native strike; "
@@ -259,9 +269,9 @@ def check_generator_contract() -> None:
 
 
 STRIKES_FILE = FONT_DIR / "cjk_strikes.txt"
-# Every selectable size is strike-based now: 12-14 native, 15 = 14 strike,
-# 16 native, 17-20 = deterministic upscale of the 16 px strike.
-NATIVE_SIZES = tuple(range(12, 21))
+# Every selectable size is strike-based: 12-14 native, 15 = 14 px strike,
+# 16 native, 18/20 = deterministic upscale of the 16 px strike.
+NATIVE_SIZES = (12, 13, 14, 15, 16, 18, 20)
 
 
 def check_native_strikes(inventory: set[int], sizes: tuple[int, ...]) -> None:
@@ -393,16 +403,14 @@ def check_native_geometry(path: Path) -> None:
 # 12-16 px freeze and >=16 px stroke balance
 # ---------------------------------------------------------------------------
 # Hash non-Latin bitmaps and metrics, Latin advances, and cmap geometry.
-FROZEN_SIZES = tuple(range(12, 21))
+FROZEN_SIZES = (12, 13, 14, 15, 16, 18, 20)
 FROZEN_DATA_SHA256 = {
     12: "921075352d003b1a4d0a3402d3af015b00ed5dcbc97faa58783e9f64c608367d",
     13: "447d8311f86bbc1d9919810bd88486dbc45f5114cd46db39ec819b230136212e",
     14: "230653e7ba0f413a81edfcc31be37a95f37d6b8d6e2a562425933704affa6bd9",
     15: "4474c8fffeddbe4b1c0dd00c3a2db6fdea64045b35511eb79a91ae4dc3cceed2",
     16: "c98ae1ec3910574439355b7b2d6b383dfdee12e315aa25d6a89378fdf8c975fe",
-    17: "e62fbde3e1984d0f1be88f1e6c353b7910fbcddf4e9300e101c5f558dc54608f",
     18: "a24dfc067b62f8b1fb6bf814fbf79d022c3c4330af83728440fa03a0344719eb",
-    19: "6bc83738c3405563ce3ef0dd8123ca9aa774f508e2806cb8348a0787d135b72e",
     20: "65944540ae9bb3f48391afe2a4793e8d0ad4c89f7830318eaa665886f72a769c",
 }
 
@@ -410,7 +418,7 @@ FROZEN_DATA_SHA256 = {
 LATIN_GIDS = {cp - 31 for lo, hi in ((ord("A"), ord("Z")), (ord("a"), ord("z")))
               for cp in range(lo, hi + 1)}
 LATIN_LIGHT_INK = {12: 946, 13: 1028, 14: 1149, 15: 1160, 16: 1280,
-                   17: 1369, 18: 1493, 19: 1644, 20: 1756}
+                   18: 1493, 20: 1756}
 
 
 def _font_data_blob(text: str) -> bytes:
@@ -474,7 +482,7 @@ def check_strike_expansion() -> None:
     corner[8][7] = 1
     if stretch(corner, 16, 17)[8] != corner[8]:
         raise RuntimeError("Expansion added ink alongside a connected corner")
-    for size in range(17, 21):
+    for size in (18, 20):
         for stem in range(16):
             horizontal = [[int(r == stem)] * 16 for r in range(16)]
             vertical = [list(row) for row in zip(*horizontal)]
@@ -497,7 +505,7 @@ def check_strike_expansion() -> None:
 # Sampled 2x2 black-block density and vertical/horizontal 2-pixel run ratio.
 # Large strikes extend the unweighted source, so 17 px retains slightly more
 # of the native Song face's vertical weight.
-BLOCK_CEILING = {16: 4.0, 17: 1.0, 18: 1.0, 19: 1.0, 20: 1.0}
+BLOCK_CEILING = {16: 4.0, 18: 1.0, 20: 1.0}
 BALANCE_MIN, BALANCE_MAX = 0.65, 1.45
 
 
@@ -588,11 +596,10 @@ def check_stroke_balance(path: Path) -> None:
             f"{path.name}: {density:.1f} 2x2 black blocks/glyph exceeds "
             f"{BLOCK_CEILING[size]}; phase-sensitive 2 px strokes returned "
             "('some places thicker, some thinner')")
-    upper_ratio = 1.75 if size == 17 else BALANCE_MAX
-    if not (BALANCE_MIN <= ratio <= upper_ratio):
+    if not (BALANCE_MIN <= ratio <= BALANCE_MAX):
         raise RuntimeError(
             f"{path.name}: vertical/horizontal 2-px stroke ratio {ratio:.2f} "
-            f"outside {BALANCE_MIN}..{upper_ratio}; stems are uneven")
+            f"outside {BALANCE_MIN}..{BALANCE_MAX}; stems are uneven")
 
 
 def check_charset_header(inventory: set[int]) -> None:
@@ -680,7 +687,7 @@ def main() -> int:
         except RuntimeError as exc:
             errors.append(str(exc))
     try:
-        check_generator_contract()
+        check_generator_contract(sizes)
         check_strike_expansion()
     except RuntimeError as exc:
         errors.append(str(exc))

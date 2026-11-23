@@ -7,27 +7,34 @@
 // the chrome, so the freed vertical space becomes MORE TEXT, not more blank.
 #include "reader_layout.h"
 
-#define READER_FONT_COUNT (READER_FONT_MAX_SIZE - READER_FONT_MIN_SIZE + 1)
-
 // size, line_height (= size + 4), cols, normal lines, immersive lines.
 // cols = 2 * floor((BODY_W - INSET) / size) rounded down to a whole Hanzi.
 // lines = floor((BODY_H - INSET) / line_height).
 // imm_lines = floor((IMMERSIVE_H - INSET) / line_height).
-const reader_font_metrics_t g_reader_font_metrics[READER_FONT_COUNT] = {
+//
+// Rows exist only for the sizes in g_reader_font_sizes; 17 px and 19 px were
+// dropped (see reader_layout.h). Their geometry is intentionally absent so a
+// stale NVS value snaps to a neighbour instead of rendering a missing font.
+const uint8_t g_reader_font_sizes[READER_FONT_SIZE_COUNT] = {
+    12, 13, 14, 15, 16, 18, 20,
+};
+
+const reader_font_metrics_t g_reader_font_metrics[READER_FONT_SIZE_COUNT] = {
     { .size = 12, .line_h = 16, .pitch = 16, .cols = 32, .lines = 11, .imm_lines = 16 },
     { .size = 13, .line_h = 17, .pitch = 17, .cols = 30, .lines = 10, .imm_lines = 15 },
     { .size = 14, .line_h = 18, .pitch = 18, .cols = 28, .lines = 10, .imm_lines = 14 },
     { .size = 15, .line_h = 19, .pitch = 19, .cols = 26, .lines =  9, .imm_lines = 13 },
     { .size = 16, .line_h = 20, .pitch = 20, .cols = 24, .lines =  9, .imm_lines = 13 },
-    { .size = 17, .line_h = 21, .pitch = 21, .cols = 22, .lines =  8, .imm_lines = 12 },
     { .size = 18, .line_h = 22, .pitch = 22, .cols = 20, .lines =  8, .imm_lines = 12 },
-    { .size = 19, .line_h = 23, .pitch = 23, .cols = 20, .lines =  7, .imm_lines = 11 },
     { .size = 20, .line_h = 24, .pitch = 24, .cols = 18, .lines =  7, .imm_lines = 11 },
 };
 
 _Static_assert(sizeof(g_reader_font_metrics) / sizeof(g_reader_font_metrics[0]) ==
-                   READER_FONT_COUNT,
+                   READER_FONT_SIZE_COUNT,
                "one metrics row per selectable size");
+_Static_assert(sizeof(g_reader_font_sizes) / sizeof(g_reader_font_sizes[0]) ==
+                   READER_FONT_SIZE_COUNT,
+               "one size per selectable size");
 
 // Every row must fit its body box, and the immersive box must leave room for
 // the toast band at the bottom of the 240x320 panel. The last assertion is the
@@ -54,9 +61,7 @@ READER_LAYOUT_CHECK(13, 17, 30, 10, 15);
 READER_LAYOUT_CHECK(14, 18, 28, 10, 14);
 READER_LAYOUT_CHECK(15, 19, 26, 9, 13);
 READER_LAYOUT_CHECK(16, 20, 24, 9, 13);
-READER_LAYOUT_CHECK(17, 21, 22, 8, 12);
 READER_LAYOUT_CHECK(18, 22, 20, 8, 12);
-READER_LAYOUT_CHECK(19, 23, 20, 7, 11);
 READER_LAYOUT_CHECK(20, 24, 18, 7, 11);
 
 // The immersive text block plus its top inset must stay above the footer band
@@ -68,14 +73,32 @@ _Static_assert(READER_LAYOUT_IMMERSIVE_TOP + READER_LAYOUT_IMMERSIVE_H <= 288,
 
 int reader_layout_font_index(int size)
 {
-    if (size <= READER_FONT_MIN_SIZE) return 0;
-    if (size >= READER_FONT_MAX_SIZE) return READER_FONT_COUNT - 1;
-    return size - READER_FONT_MIN_SIZE;
+    int best = 0;
+    int best_gap = 0x7FFFFFFF;
+    for (int i = 0; i < READER_FONT_SIZE_COUNT; ++i) {
+        int gap = size > (int)g_reader_font_sizes[i] ? size - (int)g_reader_font_sizes[i]
+                                                     : (int)g_reader_font_sizes[i] - size;
+        if (gap < best_gap) {
+            best_gap = gap;
+            best = i;
+        }
+    }
+    return best;
+}
+
+int reader_layout_font_size(int index)
+{
+    if (index < 0) index = 0;
+    if (index >= READER_FONT_SIZE_COUNT) index = READER_FONT_SIZE_COUNT - 1;
+    return (int)g_reader_font_sizes[index];
 }
 
 int reader_layout_size_valid(int size)
 {
-    return size >= READER_FONT_MIN_SIZE && size <= READER_FONT_MAX_SIZE;
+    for (int i = 0; i < READER_FONT_SIZE_COUNT; ++i) {
+        if ((int)g_reader_font_sizes[i] == size) return 1;
+    }
+    return 0;
 }
 
 const reader_font_metrics_t *reader_layout_metrics(int size)

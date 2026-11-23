@@ -1,7 +1,7 @@
 // builtin_books.h — the guide and one full-length novel compiled into flash.
 //
 // They exist so the reader has readable content on a blank device (a merged
-// 0x0 flash clears the books partition). Uploaded books live in the SPIFFS
+// 0x0 flash clears the books partition). Uploaded books live in the
 // "books" partition; see reader_store.c.
 //
 // The bodies are stored as zdx-compressed images (builtin_books_data.c) to

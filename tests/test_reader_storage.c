@@ -99,12 +99,48 @@ static void test_hint_is_complete_utf8(void)
     }
 }
 
+// The shelf must show a book's NAME, never the "~%08lx" uniqueness hash that
+// sanitize_name() appends to a shortened file name.
+static void test_display_title(void)
+{
+    char out[64];
+
+    reader_storage_display_title("短中篇幼幼~42b8c6db.zdx", out, sizeof(out));
+    CHECK(strcmp(out, "短中篇幼幼") == 0);
+
+    reader_storage_display_title("三体.zdx", out, sizeof(out));
+    CHECK(strcmp(out, "三体") == 0);
+
+    // Uppercase hex is not what the generator emits; keep it visible.
+    reader_storage_display_title("book~DEADBEEF.zdx", out, sizeof(out));
+    CHECK(strcmp(out, "book~DEADBEEF") == 0);
+
+    // Not exactly eight digits: not a hash, keep the name.
+    reader_storage_display_title("第一版~2024.zdx", out, sizeof(out));
+    CHECK(strcmp(out, "第一版~2024") == 0);
+
+    // A name that is only the hash still needs a label, not an empty row.
+    reader_storage_display_title("~1a2b3c4d.zdx", out, sizeof(out));
+    CHECK(out[0] != '\0');
+
+    // Truncation is bounded and NUL-terminated.
+    reader_storage_display_title("一二三四五六七八九十一二三四五六七八九十.zdx", out, 16);
+    CHECK(strlen(out) == 15);
+    CHECK(out[15] == '\0');
+
+    reader_storage_display_title("", out, sizeof(out));
+    CHECK(strcmp(out, "") == 0);
+    reader_storage_display_title(NULL, out, sizeof(out));
+    CHECK(strcmp(out, "") == 0);
+}
+
 int main(void)
 {
     test_percent();
     test_upload_budget();
     test_hint_bounds();
     test_hint_scales();
+    test_display_title();
     test_hint_is_complete_utf8();
 
     if (failures) {

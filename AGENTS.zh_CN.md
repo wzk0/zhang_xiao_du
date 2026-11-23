@@ -36,6 +36,15 @@
 - 二次开发必须自行重新设计并实现 UI。禁止复用 demo 测试菜单、页面或界面外壳；
   改名、换颜色或在外壳上加功能都不算重新设计。BSP API 与非 UI 逻辑可以复用。
 - LVGL 非线程安全。LVGL 任务之外的代码访问 LVGL 对象时必须持有 `bsp_lvgl_lock()`。
+- 书库是 `books` 分区上的 LittleFS，每一字节都要算：factory 分区按实测镜像定大小
+  （具体数字写在 `partitions.csv`）；能在设备上重算的派生数据不常驻内存，需要跨重启
+  复用的派生缓存（目录索引、页表、上传书名）写进 `reader_store.c` 管理的隐藏
+  `.i/.p/.n` 文件，替换或删除书籍时一并失效。
+- factory 的大小按实测镜像定，不靠猜。会**移动** books 分区起始位置的分区表改动会让
+  旧数据留在新范围内，所以 `reader_store_init()` 在挂载失败时就格式化——拒绝格式化
+  等于设备没有书库、界面直接冻死。
+- 任何依赖排版几何的持久数据（返回历史、页表）都以 `history_layout_key()` 为键；
+  `reader_text.c` 或 `reader_layout.c` 改变分页方式时必须把它的高位加一。
 - 中文界面必须有真实字形覆盖。Montserrat 字体没有中文字形，UTF-8 源码和编译成功
   都不能证明能显示。字体由 `tools/gen_reader_font.py` 从 `assets/fonts/charset.txt`
   生成到 `assets/fonts/lv_font_reader_*.c`，`tests/test_reader_font_coverage.py` 与

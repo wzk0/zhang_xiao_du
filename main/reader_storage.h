@@ -8,11 +8,23 @@
 
 #include <stddef.h>
 
+// The reader-facing name of an upload: the browser's file name without a
+// trailing ".txt"/".zdx". This is what gets stored next to the book, because the
+// file NAME on flash is an id (possibly truncated and hashed) and the reader
+// must see what they uploaded.
+void reader_storage_clean_title(const char *file_name, char *out, size_t out_size);
+
+// Shelf title for an uploaded book. `file_name` is the on-flash name
+// ("名字~3f2a1b9c.zdx"); the result drops the ".zdx" extension and the
+// "~%08lx" hash. That hash exists only to keep two truncated ids unique — it is
+// an implementation detail the reader must never see on the shelf.
+void reader_storage_display_title(const char *file_name, char *out, size_t out_size);
+
 // Saturated percentage: total == 0 and part > total are both handled without
 // dividing by zero or reporting a nonsense >100 value.
 int reader_storage_percent(size_t part, size_t total);
 
-// Maximum temporary upload payload, with headroom for SPIFFS metadata.
+// Maximum temporary upload payload, with headroom for filesystem metadata.
 size_t reader_storage_upload_budget(size_t free_bytes);
 
 // Compose one Chinese sentence estimating how many more books/articles fit in

@@ -9,6 +9,7 @@
 
 #include "reader_fonts.h"
 #include "reader_layout.h"
+#include "reader_pagemap.h"
 #include "reader_storage.h"
 #include "reader_transfer.h"
 
@@ -134,6 +135,11 @@ static lv_obj_t *new_screen(reader_screen_t screen)
     if (s_screen) lv_obj_delete(s_screen);
     s_battery = NULL;
     s_t_free = s_t_bar = s_t_status = s_t_detail = s_t_conn = NULL;
+    // The loading overlay is a child of the screen just deleted. Keeping these
+    // pointers would make the next reader_ui_update_loading() write into freed
+    // objects: that is exactly what rebooted the device when a book was reopened
+    // after a font change (the reopen re-runs the progress walk).
+    s_load_status = s_load_bar = NULL;
     s_current = screen;
 
     lv_obj_t *scr = lv_obj_create(NULL);
@@ -437,7 +443,8 @@ void reader_ui_render_library(const reader_book_info_t *books, int count,
 // ---------------------------------------------------------------------------
 void reader_ui_render_reader(const char *title, const char *chapter,
                              const char *page_text, int font_size,
-                             int percent, const char *battery, int auto_mode,
+                             int percent, int page, int page_count,
+                             const char *battery, int auto_mode,
                              int immersive)
 {
     lv_obj_t *scr = new_screen(READER_SCREEN_READER);
@@ -494,9 +501,19 @@ void reader_ui_render_reader(const char *title, const char *chapter,
 
     if (percent < 0) percent = 0;
     if (percent > 100) percent = 100;
-    char progress[40];
-    snprintf(progress, sizeof(progress), "已读 %d%%%s", percent,
-             auto_mode ? " · 自动翻页" : "");
+    // "已读 42% - 3/30": the percentage is byte progress, the fraction is the
+    // page the reader is on out of the pages this geometry produces. Both come
+    // from the application; the UI only prints them.
+    // Worst case is two 10-digit counters plus the auto-page suffix; 64 bytes
+    // keeps -Wformat-truncation quiet.
+    char progress[64];
+    if (page > 0 && page_count > 0) {
+        snprintf(progress, sizeof(progress), "已读 %d%% · %d/%d%s", percent,
+                 page, page_count, auto_mode ? " · 自动翻页" : "");
+    } else {
+        snprintf(progress, sizeof(progress), "已读 %d%%%s", percent,
+                 auto_mode ? " · 自动翻页" : "");
+    }
     lv_obj_t *pl = label(scr, UI_X, 256, READER_LAYOUT_BODY_W, F_SMALL, C_SUB);
     lv_label_set_text(pl, progress);
 
@@ -600,6 +617,7 @@ void reader_ui_render_confirm(const char *question, const char *item,
 // ---------------------------------------------------------------------------
 void reader_ui_render_toc(const reader_book_index_t *index,
                           int mark_count, const char *const *mark_titles,
+                          int page_groups, int page_count,
                           int mode, int focus, int selected,
                           const char *battery)
 {
@@ -609,17 +627,22 @@ void reader_ui_render_toc(const reader_book_index_t *index,
     // inside the tabs themselves.
     header(scr, "目录", NULL, battery);
 
-    // Two equal-width tabs centred as a pair. 2*96 + 12 = 204 px, which leaves
-    // exactly UI_X (18 px) on each side of the 240 px panel.
-    const int tab_w = 96, gap = 12;
-    const int x0 = (UI_W - (2 * tab_w + gap)) / 2;
-    char tab_names[2][24];
-    snprintf(tab_names[0], sizeof(tab_names[0]), "目录(%d章)", chapters);
-    snprintf(tab_names[1], sizeof(tab_names[1]), "书签(%d个)", mark_count);
-    for (int t = 0; t < 2; ++t) {
+    // Three equal-width tabs. 3*60 + 2*12 = 204 px, which leaves exactly UI_X
+    // (18 px) on each side of the 240 px panel. Labels are shorter than the old
+    // two-tab "目录(12章)" wording because each tab is only 60 px wide now.
+    const int tab_w = 60, gap = 12;
+    const int x0 = (UI_W - (3 * tab_w + 2 * gap)) / 2;
+    char tab_names[3][24];
+    snprintf(tab_names[0], sizeof(tab_names[0]), "章节 %d", chapters);
+    snprintf(tab_names[1], sizeof(tab_names[1]), "书签 %d", mark_count);
+    // The page tab's number is the total page count, which is what the reader
+    // wants to know before picking a range.
+    if (page_count > 0) snprintf(tab_names[2], sizeof(tab_names[2]), "共%d页", page_count);
+    else snprintf(tab_names[2], sizeof(tab_names[2]), "页码");
+    for (int t = 0; t < 3; ++t) {
         bool active = t == mode;
         int x = x0 + t * (tab_w + gap);
-        (void)centered_label(scr, x, 58, tab_w, F_BODY,
+        (void)centered_label(scr, x, 58, tab_w, F_SMALL,
                              active ? C_INK : C_SUB, tab_names[t]);
         if (active) {
             // A wider underline marks the "picking a tab" focus; a narrow one
@@ -635,12 +658,14 @@ void reader_ui_render_toc(const reader_book_index_t *index,
         }
     }
 
-    const int count = mode == 0 ? chapters : mark_count;
+    const int count = mode == 0 ? chapters : (mode == 1 ? mark_count : page_groups);
     if (count == 0) {
         lv_obj_t *t = label(scr, UI_X, 100, UI_W - 2 * UI_X, F_SMALL, C_SUB);
         lv_obj_set_style_text_line_space(t, -1, 0);
-        lv_label_set_text(t, mode == 0 ? "这本书没有可识别的章节标题"
-                                       : "还没有书签\n阅读时长按上键添加");
+        const char *empty = mode == 0 ? "这本书没有可识别的章节标题"
+                           : mode == 1 ? "还没有书签\n阅读时长按上键添加"
+                                       : "正在统计页数"; 
+        lv_label_set_text(t, empty);
     } else {
         // Four rows fit between the tab underline (y=81) and the footer hint.
         const int rows = 4;
@@ -663,6 +688,13 @@ void reader_ui_render_toc(const reader_book_index_t *index,
                                 sel ? C_ACCENT : C_INK);
             if (mode == 0) {
                 lv_label_set_text(t, index->items[idx].title);
+            } else if (mode == 2) {
+                // A tenth of the book per row: chapters are sometimes missing or
+                // wrong, so this tab is the fallback for finding a place.
+                int first = idx * (int)READER_PAGEMAP_GROUP + 1;
+                int last = first + (int)READER_PAGEMAP_GROUP - 1;
+                if (page_count > 0 && last > page_count) last = page_count;
+                lv_label_set_text_fmt(t, "%d—%d页", first, last);
             } else {
                 // The label is the sentence AT the bookmark, generated by the
                 // application from the book text. A chapter heading would be
@@ -678,11 +710,12 @@ void reader_ui_render_toc(const reader_book_index_t *index,
     if (s_hint[0]) {
         footer(scr, s_hint, NULL);
     } else if (focus == 0) {
-        footer(scr, "上/下 切换标签", "确定 进入");
+        footer(scr, "上/下 切换标签", "长按确定 退出");
     } else if (mode == 1) {
-        footer(scr, "长按上/下 删除", "长按确定 返回");
+        footer(scr, "长按上/下 删除", "长按确定 标签");
     } else {
-        footer(scr, "确定 跳转", "长按 返回");
+        // Chapters and page ranges can be long lists, so holding UP/DOWN scrolls.
+        footer(scr, "长按上/下 快滚", "确定 跳转");
     }
     show(scr);
 }
@@ -690,41 +723,108 @@ void reader_ui_render_toc(const reader_book_index_t *index,
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
+// One ruler page for every "pick a value" setting: a big readout, one dot per
+// selectable value, and a single hint line. 正文字号 keeps its own layout because
+// it previews real body text; these two only need the value and the dots.
+static void render_ruler_picker(reader_screen_t screen, const char *title,
+                                const char *value, int steps, int active,
+                                const char *hint, const char *left_hint,
+                                const char *right_hint, const char *battery)
+{
+    lv_obj_t *scr = new_screen(screen);
+    header(scr, title, NULL, battery);
+
+    // The value is the whole point of the page: largest glyph on screen, in the
+    // same slot the font picker uses for its pixel size.
+    (void)centered_label(scr, UI_X, 132, UI_W - 2 * UI_X, F_NUM, C_ACCENT, value);
+    if (hint && hint[0]) {
+        lv_obj_t *h = label(scr, UI_X, 172, UI_W - 2 * UI_X, F_SMALL, C_SUB);
+        lv_obj_set_style_text_align(h, LV_TEXT_ALIGN_CENTER, 0);
+        lv_label_set_long_mode(h, LV_LABEL_LONG_WRAP);
+        lv_label_set_text(h, hint);
+    }
+
+    // One dot per selectable value, filled up to the current one.
+    const int dot = 6, gap = 8;
+    const int total_w = steps * dot + (steps - 1) * gap;
+    const int x0 = UI_X + (UI_W - 2 * UI_X - total_w) / 2;
+    for (int i = 0; i < steps; ++i) {
+        lv_obj_t *d = lv_obj_create(scr);
+        lv_obj_remove_style_all(d);
+        lv_obj_set_pos(d, x0 + i * (dot + gap), 242);
+        lv_obj_set_size(d, dot, dot);
+        lv_obj_set_style_radius(d, dot / 2, 0);
+        lv_obj_set_style_bg_color(d, i <= active ? C_ACCENT : C_LINE, 0);
+        lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
+    }
+    footer(scr, left_hint, right_hint);
+    show(scr);
+}
+
+void reader_ui_render_backlight_picker(int backlight, const char *battery)
+{
+    char value[16];
+    snprintf(value, sizeof(value), "%d%%", backlight);
+    render_ruler_picker(READER_SCREEN_BACKLIGHT, "屏幕亮度", value,
+                        READER_BACKLIGHT_STEPS,
+                        reader_backlight_step_index(backlight),
+                        "调整立即生效",
+                        "上/下 调亮度", "确定 保存返回", battery);
+}
+
+void reader_ui_render_autopage_picker(int auto_seconds, const char *battery)
+{
+    char value[16];
+    snprintf(value, sizeof(value), "%d 秒", auto_seconds);
+    render_ruler_picker(READER_SCREEN_AUTOPAGE, "自动翻页", value,
+                        READER_AUTOPAGE_OPTIONS,
+                        reader_autopage_index(auto_seconds),
+                        // The toggle lives on the reading screen, so the hint
+                        // belongs here: this is where a reader looks for it.
+                        "阅读界面双击确定 切换自动翻页",
+                        "上/下 调秒数", "确定 保存返回", battery);
+}
+
 void reader_ui_render_settings(int selected, int font_size, int backlight,
-                               int idle_seconds, int dark, int immersive,
-                               const char *battery)
+                               int auto_seconds, int idle_seconds, int dark,
+                               int immersive, const char *battery)
 {
     lv_obj_t *scr = new_screen(READER_SCREEN_SETTINGS);
     header(scr, "设置", NULL, battery);
 
     // 接收新书 is pinned at the TOP of settings: the shelf no longer carries
-    // its own action row. The remaining six rows are the reader options.
-    const char *names[7] = { "接收新书", "正文字号", "屏幕亮度", "自动息屏",
-                             "深色模式", "沉浸模式", "存储空间" };
-    char values[7][24];
-    // The ">" marks rows 0, 1 and 6 as sub-page entries rather than toggles.
+    // its own action row. The remaining rows are the reader options, in the
+    // order a reader is most likely to reach for them.
+    enum { SETTING_ROWS = 8 };
+    const char *names[SETTING_ROWS] = { "接收新书", "正文字号", "屏幕亮度",
+                                        "自动翻页", "自动息屏", "深色模式",
+                                        "沉浸模式", "存储空间" };
+    char values[SETTING_ROWS][24];
+    // The ">" marks a row that opens its own page instead of toggling in place.
     snprintf(values[0], sizeof(values[0]), "%s", "开启热点 >");
     snprintf(values[1], sizeof(values[1]), "%d px >", font_size);
-    snprintf(values[2], sizeof(values[2]), "%d%%", backlight);
-    snprintf(values[3], sizeof(values[3]), "%d 秒", idle_seconds);
-    snprintf(values[4], sizeof(values[4]), "%s", dark ? "开" : "关");
-    snprintf(values[5], sizeof(values[5]), "%s", immersive ? "开" : "关");
-    snprintf(values[6], sizeof(values[6]), "%s", "查看剩余 >");
+    snprintf(values[2], sizeof(values[2]), "%d%% >", backlight);
+    snprintf(values[3], sizeof(values[3]), "%d 秒 >", auto_seconds);
+    snprintf(values[4], sizeof(values[4]), "%d 秒", idle_seconds);
+    snprintf(values[5], sizeof(values[5]), "%s", dark ? "开" : "关");
+    snprintf(values[6], sizeof(values[6]), "%s", immersive ? "开" : "关");
+    snprintf(values[7], sizeof(values[7]), "%s", "查看剩余 >");
 
-    // Seven compact 27 px rows on a 31 px grid: 58..271, clear of the footer
-    // at 288. Adding the transfer row must not push a row under the chips.
-    for (int i = 0; i < 7; ++i) {
-        int y = 58 + i * 31;
+    // Eight rows on a 27 px grid: 58..247 plus a 24 px row ends at 271, clear of
+    // the footer chips at 288. The pitch shrank from 31 px when 自动翻页 arrived;
+    // adding a row must never push the storage entry under the hints.
+    for (int i = 0; i < SETTING_ROWS; ++i) {
+        int y = 58 + i * 27;
         bool sel = i == selected;
-        lv_obj_t *r = row(scr, UI_PILL_X, y, UI_W - 2 * UI_PILL_X, 27, sel);
+        lv_obj_t *r = row(scr, UI_PILL_X, y, UI_W - 2 * UI_PILL_X, 24, sel);
         // 接收新书 (row 0) is an action, not a toggle: give it the same cool
         // blue emphasis as the shelf's action row so it stands out. A
         // selected row always uses the accent colour so focus stays uniform.
         lv_color_t name_color = sel ? C_ACCENT
                                     : (i == 0 ? C_ACTION : C_INK);
-        lv_obj_t *n = label(r, 8, 4, 120, F_BODY, name_color);
+        lv_obj_t *n = label(r, 8, 3, 120, F_BODY, name_color);
         lv_label_set_text(n, names[i]);
-        lv_obj_t *v = label(r, 8, 4, 204, F_BODY, C_SUB);
+        lv_obj_t *v = label(r, 8, 3, 204, F_BODY, C_SUB);
         lv_obj_set_style_text_align(v, LV_TEXT_ALIGN_RIGHT, 0);
         lv_label_set_text(v, values[i]);
     }
@@ -759,7 +859,7 @@ void reader_ui_render_storage(size_t total, size_t used, size_t free_bytes,
     lv_obj_t *big = label(scr, UI_X, 86, UI_W - 2 * UI_X, F_NUM, C_ACCENT);
     lv_label_set_text(big, free_text);
 
-    // A saturated percentage keeps a failed SPIFFS query (total == 0) from
+    // A saturated percentage keeps a failed filesystem query (total == 0) from
     // dividing by zero or printing a nonsense value.
     int used_pct = reader_storage_percent(used, total);
     // Derive the free share from the used share so the two numbers always add
@@ -832,9 +932,9 @@ void reader_ui_render_font_picker(int font_size, const char *battery)
     (void)centered_label(scr, UI_X, 206, UI_W - 2 * UI_X, F_NUM, C_ACCENT,
                          value);
 
-    // Nine dots: one per selectable size, filled up to the current one, so the
+    // One dot per selectable size, filled up to the current one, so the
     // position inside the range is readable at a glance.
-    const int steps = READER_FONT_MAX_SIZE - READER_FONT_MIN_SIZE + 1;
+    const int steps = READER_FONT_SIZE_COUNT;
     const int dot = 6, gap = 8;
     const int total_w = steps * dot + (steps - 1) * gap;
     const int x0 = UI_X + (UI_W - 2 * UI_X - total_w) / 2;
@@ -844,7 +944,7 @@ void reader_ui_render_font_picker(int font_size, const char *battery)
         lv_obj_set_pos(d, x0 + i * (dot + gap), 242);
         lv_obj_set_size(d, dot, dot);
         lv_obj_set_style_radius(d, dot / 2, 0);
-        bool on = i <= font_size - READER_FONT_MIN_SIZE;
+        bool on = i <= reader_layout_font_index(font_size);
         lv_obj_set_style_bg_color(d, on ? C_ACCENT : C_LINE, 0);
         lv_obj_set_style_bg_opa(d, LV_OPA_COVER, 0);
     }

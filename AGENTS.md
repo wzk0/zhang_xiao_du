@@ -49,6 +49,18 @@ retain the separate authorization requirements for flashing, Git writes, and pub
   remain reusable.
 - LVGL is not thread-safe. Code outside the LVGL task must hold `bsp_lvgl_lock()`
   while accessing LVGL objects.
+- The book store is LittleFS on the `books` partition and every byte of it
+  matters: keep the factory app sized from a measured build (`partitions.csv`
+  documents the number), never cache derived data in RAM that the reader can
+  recompute, and persist derived caches (index, page map, upload title) in the
+  hidden `.i/.p/.n` files that `reader_store.c` invalidates on replace/delete.
+- `factory` is sized from the measured image, not a guess. A partition-table
+  change that MOVES the books partition leaves stale data inside the new bounds,
+  so `reader_store_init()` formats whenever the mount fails — a refusal would
+  leave the device without a store and freeze the UI.
+- Anything persisted that depends on the pagination geometry (back history, page
+  map) is keyed by `history_layout_key()`; bump its high bits whenever
+  `reader_text.c` or `reader_layout.c` changes how pages are laid out.
 - Chinese UI text needs real glyph coverage. The Montserrat fonts have no Chinese
   glyphs; UTF-8 source and a successful build prove nothing. Fonts are generated
   into `assets/fonts/lv_font_reader_*.c` by `tools/gen_reader_font.py` from

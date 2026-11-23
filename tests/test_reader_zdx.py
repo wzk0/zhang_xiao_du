@@ -44,10 +44,19 @@ def make_fixtures(d: Path) -> list[str]:
         lambda b: struct.pack_into("<I", b, z.HEADER_SIZE + 4, 0x7FFFFFFF),
     )
 
+    # A book uploaded by the previous firmware: 4 KiB chunks, 4 KiB window. The
+    # decoder accepts any power-of-two chunk size up to READER_ZDX_CHUNK, so an
+    # existing library keeps working instead of having to be re-uploaded.
+    legacy = z.encode(raw, chunk=4096, window_bits=12)
+    (d / "legacy.zdx").write_bytes(legacy)
+    (d / "legacy.txt").write_bytes(raw)
+    assert z.decode(legacy) == raw
+
     # The python decoder must agree with the fixture too (encoder oracle).
     assert z.decode(blob) == raw
     return [str(d / "good.zdx"), str(d / "good.txt"),
-            bad_magic, bad_version, bad_size, str(d / "truncated.zdx"), bad_table]
+            bad_magic, bad_version, bad_size, str(d / "truncated.zdx"), bad_table,
+            str(d / "legacy.zdx"), str(d / "legacy.txt")]
 
 
 def main() -> int:

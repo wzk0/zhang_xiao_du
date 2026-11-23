@@ -3,7 +3,13 @@
 
 The on-device decoder lives in main/reader_zdx.c; this module produces the exact
 byte layout it expects and is the oracle the host tests compare against. The
-transfer web page uses pako with the same windowBits=12 raw-deflate settings.
+transfer web page uses pako with the same windowBits=14 raw-deflate settings.
+
+16 KiB chunks are one independent deflate stream each, so the chunk size is also
+the LZ77 window: on a real book 4 KiB chunks compress to 55.3 % of the original,
+16 KiB to 51.2 % (32 KiB only reaches 50.6 % for twice the dictionary buffer).
+The decoder accepts any power-of-two chunk size up to READER_ZDX_CHUNK, so older
+4 KiB books keep loading.
 """
 from __future__ import annotations
 
@@ -12,10 +18,10 @@ import zlib
 
 MAGIC = b"ZDX1"
 VERSION = 1
-CHUNK = 4096
+CHUNK = 16384
 HEADER_SIZE = 32
 TABLE_ENTRY = 8
-WINDOW_BITS = 12  # 4 KiB window, matches reader_zdx.dict[4096]
+WINDOW_BITS = 14  # 16 KiB window, matches reader_zdx.dict[16384]
 COMP_LEVEL = 9
 
 
@@ -23,10 +29,14 @@ def _count_chars(text: str) -> int:
     return sum(1 for c in text if not c.isspace())
 
 
-def encode(raw: bytes) -> bytes:
-    """Compress UTF-8 `raw` into a zdx image (raw deflate, 4 KiB chunks)."""
-    chunks = [raw[i:i + CHUNK] for i in range(0, len(raw), CHUNK)] or [b""]
-    comps = [zlib.compress(c, COMP_LEVEL, wbits=-WINDOW_BITS) for c in chunks]
+def encode(raw: bytes, chunk: int = CHUNK, window_bits: int = WINDOW_BITS) -> bytes:
+    """Compress UTF-8 `raw` into a zdx image (raw deflate, 16 KiB chunks).
+
+    `chunk`/`window_bits` are overridable so the host tests can also produce a
+    legacy 4 KiB image and prove old uploads still decode.
+    """
+    chunks = [raw[i:i + chunk] for i in range(0, len(raw), chunk)] or [b""]
+    comps = [zlib.compress(c, COMP_LEVEL, wbits=-window_bits) for c in chunks]
 
     text = raw.decode("utf-8", errors="replace")
     chars = _count_chars(text)
@@ -35,7 +45,7 @@ def encode(raw: bytes) -> bytes:
     header[0:4] = MAGIC
     header[4] = VERSION
     header[5] = 1  # flags: raw deflate
-    struct.pack_into("<IIII", header, 8, CHUNK, len(chunks), len(raw), chars)
+    struct.pack_into("<IIII", header, 8, chunk, len(chunks), len(raw), chars)
 
     table_size = len(comps) * TABLE_ENTRY
     data_start = HEADER_SIZE + table_size
@@ -70,10 +80,11 @@ def header_fields(blob: bytes) -> dict:
 def decode(blob: bytes) -> bytes:
     """Pure-python decoder used as a cross-check oracle."""
     f = header_fields(blob)
+    window_bits = max(9, f["chunk"].bit_length() - 1)
     out = bytearray()
     for i in range(f["count"]):
         off, ln = struct.unpack_from("<II", blob, HEADER_SIZE + i * TABLE_ENTRY)
-        out += zlib.decompress(blob[off:off + ln], wbits=-WINDOW_BITS)
+        out += zlib.decompress(blob[off:off + ln], wbits=-window_bits)
     assert len(out) == f["original_size"], (len(out), f["original_size"])
     return bytes(out)
 

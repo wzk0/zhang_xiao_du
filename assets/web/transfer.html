@@ -90,7 +90,7 @@ li button{width:auto;padding:0;background:transparent;color:var(--accent);font-s
 </script>
 <script>
 // ---- 常量（与设备端 reader_zdx.h 一致）----------------------------------
-var ZDX_MAGIC='ZDX1', ZDX_VERSION=1, ZDX_CHUNK=4096, ZDX_HEADER=32, ZDX_TABLE=8;
+var ZDX_MAGIC='ZDX1', ZDX_VERSION=1, ZDX_CHUNK=16384, ZDX_HEADER=32, ZDX_TABLE=8;
 var ZDX_MAX_CHUNKS=131072;
 
 function fmtSize(b){
@@ -211,8 +211,10 @@ function encodeZdx(raw,chars){
   var parts=[header], offset=header.length;
   for(var i=0;i<count;i++){
     var start=i*ZDX_CHUNK;
+    // 16 KiB 一个独立 deflate 流：块大小同时是 LZ77 窗口，4 KiB 块会把中文文本的
+    // 跨块重复全部浪费掉（实测 55.3% vs 51.2%），详见 main/reader_zdx.h。
     var compressed=pako.deflate(raw.subarray(start,start+ZDX_CHUNK),
-                               {level:9,raw:true,windowBits:12});
+                               {level:9,raw:true,windowBits:14});
     var entry=ZDX_HEADER+i*ZDX_TABLE;
     header.set(u32(offset),entry);
     header.set(u32(compressed.length),entry+4);

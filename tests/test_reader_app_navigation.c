@@ -65,6 +65,10 @@ static size_t g_cover_bytes;
 // simulate a book that has never been opened (no progress record).
 static int g_force_first_open;
 static unsigned g_loading_percent;
+static int g_last_page;
+static int g_last_page_count;
+static int g_last_page_groups;
+static int g_settings_auto_seconds;
 static bool g_slow_index;
 
 void reader_ui_init(void) { }
@@ -87,19 +91,25 @@ void reader_ui_render_library(const reader_book_info_t *books, int count,
 }
 void reader_ui_render_reader(const char *title, const char *chapter,
                              const char *page_text, int font_size, int percent,
-                             const char *battery, int auto_mode, int immersive)
+                             int page, int page_count, const char *battery,
+                             int auto_mode, int immersive)
 {
     (void)title; (void)chapter; (void)page_text; (void)font_size; (void)percent;
     (void)battery; (void)auto_mode; (void)immersive;
+    g_last_page = page;
+    g_last_page_count = page_count;
     g_rendered = READER_SCREEN_READER;
 }
 void reader_ui_render_toc(const reader_book_index_t *index, int mark_count,
-                          const char *const *mark_titles, int mode, int focus,
-                          int selected, const char *battery)
+                          const char *const *mark_titles, int page_groups,
+                          int page_count, int mode, int focus, int selected,
+                          const char *battery)
 {
     (void)index; (void)mode; (void)focus; (void)selected; (void)battery;
     g_rendered = READER_SCREEN_TOC;
     g_last_mark_count = mark_count;
+    g_last_page_groups = page_groups;
+    g_last_page_count = page_count;
     for (int i = 0; i < READER_BOOKMARK_MAX; ++i) {
         if (mark_titles && mark_titles[i]) {
             snprintf(g_last_mark_titles[i], READER_BOOKMARK_TITLE_SIZE, "%s",
@@ -110,12 +120,23 @@ void reader_ui_render_toc(const reader_book_index_t *index, int mark_count,
     }
 }
 void reader_ui_render_settings(int selected, int font_size, int backlight,
-                               int idle_seconds, int dark, int immersive,
-                               const char *battery)
+                               int auto_seconds, int idle_seconds, int dark,
+                               int immersive, const char *battery)
 {
     (void)selected; (void)font_size; (void)backlight; (void)idle_seconds;
     (void)dark; (void)immersive; (void)battery;
+    g_settings_auto_seconds = auto_seconds;
     g_rendered = READER_SCREEN_SETTINGS;
+}
+void reader_ui_render_backlight_picker(int backlight, const char *battery)
+{
+    (void)backlight; (void)battery;
+    g_rendered = READER_SCREEN_BACKLIGHT;
+}
+void reader_ui_render_autopage_picker(int auto_seconds, const char *battery)
+{
+    (void)auto_seconds; (void)battery;
+    g_rendered = READER_SCREEN_AUTOPAGE;
 }
 void reader_ui_render_font_picker(int font_size, const char *battery)
 {
@@ -247,6 +268,21 @@ int reader_store_list(reader_book_info_t *out, int max)
         ++n;
     }
     return n;
+}
+
+// The page-map cache lives in the real store; the stub always misses so the
+// state machine rebuilds (and the assertions below stay independent of flash).
+int reader_store_pagemap_load(const char *id, uint32_t geometry, uint32_t book_size,
+                              reader_pagemap_t *map)
+{
+    (void)id; (void)geometry; (void)book_size; (void)map;
+    return 0;
+}
+
+void reader_store_pagemap_save(const char *id, uint32_t geometry, uint32_t book_size,
+                               const reader_pagemap_t *map)
+{
+    (void)id; (void)geometry; (void)book_size; (void)map;
 }
 
 esp_err_t reader_store_space(size_t *total, size_t *used, size_t *free_bytes)
@@ -758,6 +794,9 @@ static void test_bookmark_excerpt_and_delete(void)
     CHECK(s_state.screen == READER_SCREEN_TOC);
     CHECK(s_state.bookmark_count == 0);
     CHECK(strstr(s_hint, "已删除书签") != NULL);
+    // Long OK backs out one level per press: list -> tab row -> reader.
+    hold(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_TOC);
     hold(BSP_BTN_OK);            // long OK returns to the reader
     CHECK(s_state.screen == READER_SCREEN_READER);
 }
@@ -793,9 +832,9 @@ static void test_pinned_action_rows(void)
     hold(BSP_BTN_OK);
     CHECK(s_state.screen == READER_SCREEN_SETTINGS);
 
-    // Settings has 7 rows; the last one is the storage sub-page.
-    for (int i = 0; i < 6; ++i) tap(BSP_BTN_DOWN);
-    CHECK(s_state.setting_selected == 6);
+    // Settings has 8 rows; the last one is the storage sub-page.
+    for (int i = 0; i < 7; ++i) tap(BSP_BTN_DOWN);
+    CHECK(s_state.setting_selected == 7);
     tap(BSP_BTN_OK);
     CHECK(s_state.screen == READER_SCREEN_STORAGE);
     CHECK(g_rendered == READER_SCREEN_STORAGE);
@@ -923,7 +962,8 @@ static void test_shelf_ui_contract(void)
     CHECK(strstr(src, "footer(scr, \"上/下 选择 长按删除\", \"确定 打开\")") != NULL);
     CHECK(strstr(src, "footer3(") == NULL);                   // back to two chips
     CHECK(strstr(src, "%d 本书 · 长按上/下删除") == NULL);      // no header hint
-    CHECK(strstr(src, "const char *names[7] = { \"接收新书\"") != NULL);
+    CHECK(strstr(src, "enum { SETTING_ROWS = 8 };") != NULL);
+    CHECK(strstr(src, "\"接收新书\", \"正文字号\", \"屏幕亮度\",") != NULL);
     CHECK(strstr(src, "header(scr, \"存储空间\", NULL, battery)") != NULL);
     CHECK(strstr(src, "header(scr, \"存储空间\", \"书籍分区\"") == NULL);
     CHECK(strstr(src, "void reader_ui_render_finished(const char *book_title)") != NULL);
@@ -1020,6 +1060,294 @@ static void test_all_builtin_books_readable(void)
     }
 }
 
+// Page numbers feed two places: the reader footer ("已读 42% - 3/30") and the
+// TOC page tab ("1—10页"). Both come from the page map, which is geometry
+// dependent. This also covers the state-machine half of the "reopen after a
+// font change" reboot: a geometry change invalidates the saved resume history,
+// so the reopen re-runs the progress walk with a live page map.
+static void test_page_numbers_and_page_tab(void)
+{
+    reset_fixture();
+    open_first_book();
+    CHECK(s_state.pagemap.pages > 0);
+    CHECK(s_state.pagemap.groups > 0);
+    CHECK(s_state.page_no == 1);
+    CHECK(g_last_page == 1);
+    CHECK(g_last_page_count == (int)s_state.pagemap.pages);
+
+    tap(BSP_BTN_DOWN);
+    CHECK(s_state.page_no == 2);
+    CHECK(g_last_page == 2);
+
+    // TOC: tab row cycles chapters -> bookmarks -> pages.
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_TOC);
+    CHECK(s_state.toc_mode == 0);
+    tap(BSP_BTN_DOWN);
+    CHECK(s_state.toc_mode == 1);
+    tap(BSP_BTN_DOWN);
+    CHECK(s_state.toc_mode == 2);
+    CHECK(g_last_page_groups == (int)s_state.pagemap.groups);
+    CHECK(g_last_page_count == (int)s_state.pagemap.pages);
+
+    // Entering the list lands on the range that contains the current page.
+    tap(BSP_BTN_OK);
+    CHECK(s_state.toc_focus == 1);
+    CHECK(s_state.toc_selected ==
+          (int)((s_state.page_no - 1) / READER_PAGEMAP_GROUP));
+    int last_group = (int)s_state.pagemap.groups - 1;
+    // The contextual selection may already be the last range; walk down until
+    // the cursor is on it rather than assuming it started at row 0.
+    while (s_state.toc_selected < last_group) tap(BSP_BTN_DOWN);
+    CHECK(s_state.toc_selected == last_group);
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_READER);
+    CHECK(s_state.page_no == (uint32_t)last_group * READER_PAGEMAP_GROUP + 1);
+
+    // Font picker steps wrap too: 20 px -> 12 px on one UP.
+    s_state.screen = READER_SCREEN_FONT_PICKER;
+    s_state.font_size = READER_FONT_MAX_SIZE;
+    scroll_step(1);
+    CHECK(s_state.font_size == reader_layout_font_size(0));
+    scroll_step(-1);
+    CHECK(s_state.font_size == READER_FONT_MAX_SIZE);
+    // Holding UP keeps stepping until the key is released.
+    hold(BSP_BTN_UP);
+    int held = reader_layout_font_index(s_state.font_size);
+    scroll_tick(NULL);
+    CHECK(reader_layout_font_index(s_state.font_size) != held ||
+          READER_FONT_SIZE_COUNT == 1);
+    key(BSP_BTN_UP, BSP_BTN_RELEASE);
+    s_state.screen = READER_SCREEN_READER;
+
+    // A font-size change must re-page the whole book, not keep stale numbers.
+    uint32_t pages_before = s_state.pagemap.pages;
+    s_state.font_size = READER_FONT_MAX_SIZE;
+    commit_font_size();
+    CHECK(s_state.pagemap.pages > pages_before);
+    CHECK(s_state.page_no >= 1);
+    CHECK(s_state.page_no <= s_state.pagemap.pages);
+    uint32_t pages_after = s_state.pagemap.pages;
+
+    // Leave the book and come back: the layout key no longer matches the stored
+    // history, so open_book() walks the chapter again. Nothing may reset the
+    // page counter to zero or lose the page map.
+    hold(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_LIBRARY);
+    CHECK(s_state.page_no == 0);
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_READER);
+    CHECK(s_state.pagemap.pages == pages_after);
+    CHECK(s_state.page_no >= 1 && s_state.page_no <= s_state.pagemap.pages);
+    tap(BSP_BTN_DOWN);
+    CHECK(s_state.page_no >= 1);
+}
+
+// "Take me where I am": every TOC tab must open on the reader's own position
+// (current chapter, nearest bookmark at or before this page, current page range)
+// instead of scrolling from row 0 of the book.
+static void test_toc_tabs_open_on_current_position(void)
+{
+    reset_fixture();
+    open_first_book();
+
+    // Two bookmarks at different pages, then move past both of them.
+    tap(BSP_BTN_DOWN);
+    hold(BSP_BTN_UP);                 // bookmark 0 on page 2
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);
+    hold(BSP_BTN_UP);                 // bookmark 1 on page 4
+    tap(BSP_BTN_DOWN);                // page 5: past both
+    CHECK(s_state.bookmark_count == 2);
+
+    // --- tab row direction -------------------------------------------------
+    tap(BSP_BTN_OK);                  // TOC opens on the chapter tab (left)
+    CHECK(s_state.screen == READER_SCREEN_TOC);
+    CHECK(s_state.toc_focus == 0);
+    CHECK(s_state.toc_mode == 0);
+    tap(BSP_BTN_UP);                  // UP from the leftmost tab wraps right-most
+    CHECK(s_state.toc_mode == 2);
+    tap(BSP_BTN_UP);                  // ... and keeps moving left
+    CHECK(s_state.toc_mode == 1);
+    tap(BSP_BTN_DOWN);                // DOWN moves right again
+    CHECK(s_state.toc_mode == 2);
+    hold(BSP_BTN_OK);                 // leave the TOC
+    CHECK(s_state.screen == READER_SCREEN_READER);
+    tap(BSP_BTN_OK);                  // reopen on the chapter tab
+    CHECK(s_state.toc_mode == 0);
+
+    // --- bookmarks tab -----------------------------------------------------
+    tap(BSP_BTN_DOWN);                // cycle to the bookmark tab
+    CHECK(s_state.toc_mode == 1);
+    tap(BSP_BTN_OK);                  // enter the list
+    CHECK(s_state.toc_focus == 1);
+    CHECK(s_state.toc_selected == 1); // the nearest one BEFORE this page
+
+    // --- page tab ----------------------------------------------------------
+    hold(BSP_BTN_OK);                 // list -> tab row
+    hold(BSP_BTN_OK);                 // tab row -> reader
+    tap(BSP_BTN_OK);                  // reopen the TOC
+    CHECK(s_state.toc_focus == 0 && s_state.toc_mode == 0);
+    tap(BSP_BTN_DOWN);                // 章节 -> 书签
+    tap(BSP_BTN_DOWN);                // 书签 -> 页码
+    CHECK(s_state.toc_mode == 2);
+    tap(BSP_BTN_OK);
+    CHECK(s_state.toc_selected ==
+          (int)((s_state.page_no - 1) / READER_PAGEMAP_GROUP));
+
+    // --- chapter tab -------------------------------------------------------
+    hold(BSP_BTN_OK);                 // list -> tab row
+    hold(BSP_BTN_OK);                 // tab row -> reader
+    CHECK(s_state.screen == READER_SCREEN_READER);
+    tap(BSP_BTN_OK);                  // reopen the TOC on the chapter tab
+    tap(BSP_BTN_OK);                  // enter the list
+    CHECK(s_state.toc_focus == 1);
+    CHECK(s_state.toc_selected == s_state.chapter);
+
+    // --- long-press behaviour ----------------------------------------------
+    // Long OK is "back", one level per press: list -> tab row -> reader.
+    // (The chapter list is open and focused at this point.)
+    CHECK(s_state.screen == READER_SCREEN_TOC);
+    CHECK(s_state.toc_focus == 1);
+    hold(BSP_BTN_OK);
+    CHECK(s_state.toc_focus == 0);    // back to the tab row, still in the TOC
+    CHECK(s_state.screen == READER_SCREEN_TOC);
+    hold(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_READER);  // one more press leaves
+
+    // Holding UP/DOWN scrolls the chapter list until the key is released.
+    tap(BSP_BTN_OK);                  // TOC
+    tap(BSP_BTN_OK);                  // chapter list
+    CHECK(s_state.toc_focus == 1);
+    int rows = s_state.index.count;
+    CHECK(rows > 3);
+    s_state.toc_selected = 0;
+    hold(BSP_BTN_DOWN);               // starts the hold: one immediate step
+    CHECK(s_state.toc_selected == 0 + 1);
+    scroll_tick(NULL);                // the LVGL timer keeps stepping
+    scroll_tick(NULL);
+    CHECK(s_state.toc_selected == 3);
+    key(BSP_BTN_DOWN, BSP_BTN_RELEASE);
+    scroll_tick(NULL);                // released: no further movement
+    CHECK(s_state.toc_selected == 3);
+
+    // Long UP/DOWN in the bookmark list is still the delete gesture, not scroll.
+    s_state.toc_mode = 1;
+    s_state.toc_focus = 1;
+    s_state.toc_selected = 0;
+    s_scroll_dir = 0;
+    int marks_before = s_state.bookmark_count;
+    hold(BSP_BTN_DOWN);
+    CHECK(s_scroll_dir == 0);
+    CHECK(s_state.screen == READER_SCREEN_CONFIRM);
+    (void)marks_before;
+
+    // A chapter index past the end (stale state) must clamp, never wrap.
+    s_state.chapter = 999;
+    s_state.toc_focus = 1;
+    s_state.toc_mode = 0;
+    toc_select_current();
+    CHECK(s_state.toc_selected == s_state.index.count - 1);
+}
+
+// Brightness and auto page-turn each got a ruler page (the font picker's shape)
+// instead of a row that cycles in place, and the reading screen can toggle auto
+// page-turning without leaving the book.
+static void test_ruler_settings_and_auto_page(void)
+{
+    reset_fixture();
+    CHECK(g_settings_auto_seconds == 10);   // default interval
+
+    // --- brightness ruler ---------------------------------------------------
+    hold(BSP_BTN_OK);                       // open the book? no: shelf row 0 -> reader
+    hold(BSP_BTN_OK);                       // long OK closes it again
+    CHECK(s_state.screen == READER_SCREEN_LIBRARY);
+    tap(BSP_BTN_UP);                        // pinned settings row
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_SETTINGS);
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);                      // row 2 = 屏幕亮度
+    CHECK(s_state.setting_selected == 2);
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_BACKLIGHT);
+    CHECK(g_rendered == READER_SCREEN_BACKLIGHT);
+    // Start mid-ladder: the fresh default is 100 %, the top step.
+    s_state.backlight = 40;
+    render_screen();
+    int before = reader_backlight_step_index(s_state.backlight);
+    tap(BSP_BTN_UP);
+    CHECK(reader_backlight_step_index(s_state.backlight) == before + 1);
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);
+    CHECK(reader_backlight_step_index(s_state.backlight) == before - 1);
+    hold(BSP_BTN_UP);                       // hold sweeps up, wrapping the ladder
+    int swept = reader_backlight_step_index(s_state.backlight);
+    scroll_tick(NULL);
+    scroll_tick(NULL);
+    CHECK(reader_backlight_step_index(s_state.backlight) ==
+          wrap_index(swept + 2, READER_BACKLIGHT_STEPS));
+    key(BSP_BTN_UP, BSP_BTN_RELEASE);       // release stops the sweep
+    int stopped = reader_backlight_step_index(s_state.backlight);
+    scroll_tick(NULL);
+    CHECK(reader_backlight_step_index(s_state.backlight) == stopped);
+    // Stepping down from the 5 % floor wraps to the top instead of stopping.
+    s_state.backlight = 5;
+    scroll_step(-1);
+    CHECK(s_state.backlight == 100);
+    hold(BSP_BTN_OK);                       // long OK saves and returns
+    CHECK(s_state.screen == READER_SCREEN_SETTINGS);
+
+    // --- auto page-turn ruler ----------------------------------------------
+    tap(BSP_BTN_DOWN);                      // row 3 = 自动翻页
+    CHECK(s_state.setting_selected == 3);
+    tap(BSP_BTN_OK);
+    CHECK(s_state.screen == READER_SCREEN_AUTOPAGE);
+    CHECK(g_rendered == READER_SCREEN_AUTOPAGE);
+    tap(BSP_BTN_UP);                        // 10 s -> 15 s
+    CHECK(s_state.auto_seconds == 15);
+    tap(BSP_BTN_DOWN);
+    CHECK(s_state.auto_seconds == 10);
+    // Eight intervals now, and the ladder wraps in both directions.
+    s_state.auto_seconds = reader_autopage_option(READER_AUTOPAGE_OPTIONS - 1);
+    CHECK(s_state.auto_seconds == 60);
+    scroll_step(1);
+    CHECK(s_state.auto_seconds == 5);
+    scroll_step(-1);
+    CHECK(s_state.auto_seconds == 60);
+    s_state.auto_seconds = 10;   // save the default so the settings row matches
+    tap(BSP_BTN_OK);                        // short OK saves and returns too
+    CHECK(s_state.screen == READER_SCREEN_SETTINGS);
+    CHECK(g_settings_auto_seconds == 10);
+
+    // --- reading screen toggle ---------------------------------------------
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);
+    tap(BSP_BTN_DOWN);                      // row 7 = 存储空间
+    CHECK(s_state.setting_selected == 7);
+    hold(BSP_BTN_OK);                       // long OK leaves settings for the shelf
+    CHECK(s_state.screen == READER_SCREEN_LIBRARY);
+    tap(BSP_BTN_DOWN);                      // pinned action row wraps to row 0
+    CHECK(s_state.selected == 0);
+    tap(BSP_BTN_OK);                        // open the book
+    CHECK(s_state.screen == READER_SCREEN_READER);
+    CHECK(s_auto_mode == 0);                // a session starts manual
+    key(BSP_BTN_OK, BSP_BTN_DOUBLE);        // double tap toggles auto paging
+    CHECK(s_auto_mode == 1);
+    CHECK(strstr(s_hint, "自动翻页 开") != NULL);
+    key(BSP_BTN_OK, BSP_BTN_DOUBLE);
+    CHECK(s_auto_mode == 0);
+
+    // The tick advances one page per configured interval, not per hard-coded 4 s.
+    key(BSP_BTN_OK, BSP_BTN_DOUBLE);
+    CHECK(s_auto_mode == 1);
+    s_state.auto_seconds = 20;
+    uint32_t page_before = s_state.page_offset;
+    s_auto_elapsed_ms = 19000;
+    tick(NULL);
+    CHECK(s_state.page_offset != page_before);
+}
+
 int main(void)
 {
     test_first_open_cover();
@@ -1033,6 +1361,9 @@ int main(void)
     test_deletable_builtin_samples();
     test_delete_confirmation_cancel();
     test_shelf_ui_contract();
+    test_page_numbers_and_page_tab();
+    test_toc_tabs_open_on_current_position();
+    test_ruler_settings_and_auto_page();
     reader_app_deinit();
 
     if (failures) {

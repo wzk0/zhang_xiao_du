@@ -2,12 +2,24 @@
 // so the exact device decoder is compiled into the host tests as well.
 #include "reader_zdx.h"
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <string.h>
+
+// Deflate wants a window that is a power of two; a chunk is one independent
+// stream whose window is exactly its own size.
+#define READER_ZDX_MIN_CHUNK 1024u
+#define NO_INDEX             0xFFFFFFFFu
 
 static uint32_t rd_u32(const unsigned char *p)
 {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
            ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static int is_power_of_two(uint32_t v)
+{
+    return v && (v & (v - 1)) == 0;
 }
 
 // Source abstraction: uploaded books read from a FILE, built-in books from a
@@ -58,7 +70,10 @@ int reader_zdx_probe(FILE *fp, uint32_t *original_size, uint32_t *text_chars)
     if (h[4] != READER_ZDX_VERSION || (h[5] & 0xFEu) != 0) return -1;
     uint32_t chunk = rd_u32(h + 8);
     uint32_t count = rd_u32(h + 12);
-    if (chunk == 0 || chunk > READER_ZDX_CHUNK || count == 0) return -1;
+    if (chunk < READER_ZDX_MIN_CHUNK || chunk > READER_ZDX_CHUNK || !is_power_of_two(chunk)) {
+        return -1;
+    }
+    if (count == 0) return -1;
     if (original_size) *original_size = rd_u32(h + 16);
     if (text_chars) *text_chars = rd_u32(h + 20);
     return 0;
@@ -67,7 +82,8 @@ int reader_zdx_probe(FILE *fp, uint32_t *original_size, uint32_t *text_chars)
 // Shared header validation. Caller has zeroed z and set the source fields.
 static int open_prepared(reader_zdx_t *z)
 {
-    z->cached_index = -1;
+    z->cache_index = NO_INDEX;
+    z->dec_index = NO_INDEX;
 
     if (src_seek(z, 0) != 0) return -1;
     unsigned char h[READER_ZDX_HEADER_SIZE];
@@ -78,7 +94,10 @@ static int open_prepared(reader_zdx_t *z)
     uint32_t chunk_size = rd_u32(h + 8);
     uint32_t chunk_count = rd_u32(h + 12);
     uint32_t original = rd_u32(h + 16);
-    if (chunk_size == 0 || chunk_size > READER_ZDX_CHUNK) return -1;
+    // The chunk size doubles as the deflate window, so it must be a power of two
+    // that fits the fixed dictionary buffer.
+    if (chunk_size < READER_ZDX_MIN_CHUNK || chunk_size > READER_ZDX_CHUNK) return -1;
+    if (!is_power_of_two(chunk_size)) return -1;
     if (chunk_count == 0 || chunk_count > 131072u) return -1;
 
     // A valid image with N chunks of at most chunk_size original bytes must
@@ -118,13 +137,30 @@ int reader_zdx_open_mem(reader_zdx_t *z, const unsigned char *data, size_t len)
     return open_prepared(z);
 }
 
-// Locate chunk `idx` in the table, then inflate it into out[]. The chunk table
-// is re-read from the file each time (no RAM table), which is the only way to
-// keep memory fixed on a device without PSRAM.
-static int load_chunk(reader_zdx_t *z, uint32_t idx)
+// uzlib input callback: refill `comp` from the file and hand back the next
+// byte. Streaming the compressed side keeps the decoder's RAM independent of
+// the chunk size (a 16 KiB chunk of Chinese text compresses to ~8 KiB).
+static int chunk_source_read(TINF_DATA *d)
 {
+    reader_zdx_t *z = (reader_zdx_t *)((char *)d - offsetof(reader_zdx_t, infl));
+    if (z->comp_pos >= z->comp_len) return -1;
+    size_t want = z->comp_len - z->comp_pos;
+    if (want > READER_ZDX_COMP_CAP) want = READER_ZDX_COMP_CAP;
+    if (src_seek(z, (long)(z->comp_off + z->comp_pos)) != 0) return -1;
+    size_t got = src_read(z, z->comp, want);
+    if (got == 0) return -1;
+    z->comp_pos += (uint32_t)got;
+    d->source = z->comp;
+    d->source_limit = z->comp + got;
+    return *d->source++;
+}
+
+// Point the inflater at chunk `idx` (no output yet). Idempotent while that
+// chunk stays selected, so a sequence of reads inside one chunk decodes once.
+static int chunk_begin(reader_zdx_t *z, uint32_t idx)
+{
+    if (z->dec_index == idx) return 0;
     if (idx >= z->chunk_count) return -1;
-    if (z->cached_index == (int)idx) return 0;
 
     long entry = (long)READER_ZDX_HEADER_SIZE +
                  (long)idx * (long)READER_ZDX_TABLE_ENTRY;
@@ -134,35 +170,84 @@ static int load_chunk(reader_zdx_t *z, uint32_t idx)
     uint32_t off = rd_u32(e);
     uint32_t len = rd_u32(e + 4);
     if ((uint64_t)off + len > (uint64_t)z->file_size) return -1;
-    if (len == 0 || len > READER_ZDX_COMP_CAP) return -1;
+    if (len == 0) return -1;
 
-    if (src_seek(z, (long)off) != 0) return -1;
-    if (src_read(z, z->comp, len) != len) return -1;
+    z->comp_off = off;
+    z->comp_len = len;
+    z->comp_pos = 0;
+    // Anything decoded so far described a different stream, and out[] is about
+    // to be overwritten: drop the hold-back window with the old state.
+    z->cache_index = NO_INDEX;
+    z->cache_len = 0;
+    z->dec_index = idx;
+    z->dec_produced = 0;
+    z->dec_done = 0;
 
-    memset(z->dict, 0, sizeof(z->dict));
+    memset(z->dict, 0, z->chunk_size);
     uzlib_uncompress_init(&z->infl, z->dict, (unsigned)z->chunk_size);
-    z->infl.source = z->comp;
-    z->infl.source_limit = z->comp + len;
-    z->infl.dest_start = z->out;
+    z->infl.source = NULL;
+    z->infl.source_limit = NULL;
+    z->infl.source_read_cb = chunk_source_read;
     z->infl.dest = z->out;
-    z->infl.dest_limit = z->out + z->chunk_size;
+    z->infl.dest_start = z->out;
+    z->infl.dest_limit = z->out;
     z->infl.checksum_type = TINF_CHKSUM_NONE;
-
-    int r = uzlib_uncompress(&z->infl);
-    if (r != TINF_OK && r != TINF_DONE) return -1;
-    size_t got = (size_t)(z->infl.dest - z->out);
-    if (got == 0 || got > z->chunk_size) return -1;
-
-    // A full chunk must decompress to exactly chunk_size bytes; only the final
-    // chunk may be shorter. This catches corrupted tables early.
-    if (idx + 1 < z->chunk_count && got != z->chunk_size) return -1;
-    uint64_t consumed = (uint64_t)idx * z->chunk_size + got;
-    if (consumed > z->original_size) return -1;
-    if (idx + 1 == z->chunk_count && consumed != z->original_size) return -1;
-
-    z->cached_index = (int)idx;
-    z->cached_len = (uint32_t)got;
     return 0;
+}
+
+// Inflate at most `max` original bytes into out[]. Returns the count produced
+// (0 only when the chunk's stream has ended) or -1 on a decode error. A full
+// chunk must produce exactly chunk_size bytes; only the last one may be short.
+static int decode_into(reader_zdx_t *z, uint32_t max)
+{
+    if (max == 0) return 0;
+    if (max > READER_ZDX_OUT_CAP) max = READER_ZDX_OUT_CAP;
+    if (z->dec_done) return 0;
+
+    z->infl.dest = z->out;
+    z->infl.dest_start = z->out;
+    z->infl.dest_limit = z->out + max;
+    int r = uzlib_uncompress(&z->infl);
+    size_t got = (size_t)(z->infl.dest - z->out);
+    if (r == TINF_DONE) {
+        z->dec_done = 1;
+        // Structural check: everything except the final chunk is exactly
+        // chunk_size original bytes long.
+        uint32_t expect = z->dec_index + 1 < z->chunk_count ? z->chunk_size
+                          : z->original_size - (uint32_t)z->dec_index * z->chunk_size;
+        if (z->dec_produced + got != expect) return -1;
+    } else if (r != TINF_OK) {
+        return -1;
+    }
+    z->dec_produced += (uint32_t)got;
+    if (!z->dec_done && got < max) return -1;  // stream stalled without filling
+    return (int)got;
+}
+
+// Fill the hold-back window with bytes starting at `intra` of chunk `idx`.
+static int fill_cache(reader_zdx_t *z, uint32_t idx, uint32_t intra)
+{
+    // Re-inflating always starts at the chunk's first byte, so a request behind
+    // the current decode position has to restart the stream. Reads that move
+    // forward keep going from where the inflater is.
+    if (z->dec_index != idx || intra < z->dec_produced) {
+        z->dec_index = NO_INDEX;
+        if (chunk_begin(z, idx) != 0) return -1;
+    }
+
+    while (z->dec_produced < intra) {
+        uint32_t step = intra - z->dec_produced;
+        int got = decode_into(z, step);
+        if (got < 0) return -1;
+        if (got == 0) return -1;  // chunk ended before the read offset
+    }
+
+    int got = decode_into(z, READER_ZDX_OUT_CAP);
+    if (got < 0) return -1;
+    z->cache_index = idx;
+    z->cache_start = intra;
+    z->cache_len = (uint32_t)got;
+    return got > 0 ? 0 : -1;
 }
 
 size_t reader_zdx_read(reader_zdx_t *z, size_t offset, char *buf, size_t len)
@@ -176,13 +261,20 @@ size_t reader_zdx_read(reader_zdx_t *z, size_t offset, char *buf, size_t len)
     while (copied < len) {
         size_t pos = offset + copied;
         uint32_t idx = (uint32_t)(pos / z->chunk_size);
-        size_t intra = pos % z->chunk_size;
-        if (load_chunk(z, idx) != 0) break;
-        size_t avail = z->cached_len - intra;
-        if (avail == 0) break;
+        uint32_t intra = (uint32_t)(pos % z->chunk_size);
+
+        // The window serves consecutive reads; anything outside it re-inflates
+        // the chunk from its start (bounded by the chunk size, not the file).
+        bool covered = z->cache_index == idx &&
+                       intra >= z->cache_start &&
+                       intra < z->cache_start + z->cache_len;
+        if (!covered && fill_cache(z, idx, intra) != 0) break;
+
+        uint32_t avail = z->cache_start + z->cache_len - intra;
         size_t take = len - copied;
         if (take > avail) take = avail;
-        memcpy(buf + copied, z->out + intra, take);
+        if (take == 0) break;
+        memcpy(buf + copied, z->out + (intra - z->cache_start), take);
         copied += take;
     }
     return copied;
@@ -193,8 +285,12 @@ int reader_zdx_verify(reader_zdx_t *z)
     if (!z || (!z->fp && !z->mem)) return -1;
     uint64_t total = 0;
     for (uint32_t i = 0; i < z->chunk_count; ++i) {
-        if (load_chunk(z, i) != 0) return -1;
-        total += z->cached_len;
+        if (chunk_begin(z, i) != 0) return -1;
+        while (!z->dec_done) {
+            if (decode_into(z, READER_ZDX_OUT_CAP) < 0) return -1;
+        }
+        total += z->dec_produced;
+        if (total > z->original_size) return -1;
     }
     return total == z->original_size ? 0 : -1;
 }
@@ -204,7 +300,8 @@ void reader_zdx_close(reader_zdx_t *z)
     if (!z) return;
     z->fp = NULL;
     z->mem = NULL;
-    z->cached_index = -1;
+    z->cache_index = NO_INDEX;
+    z->dec_index = NO_INDEX;
 }
 
 uint32_t reader_zdx_original_size(const reader_zdx_t *z)

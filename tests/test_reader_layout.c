@@ -21,21 +21,26 @@ static int failures;
     } \
 } while (0)
 
-#define ROW_COUNT (READER_FONT_MAX_SIZE - READER_FONT_MIN_SIZE + 1)
+#define ROW_COUNT READER_FONT_SIZE_COUNT
 
 static void test_table_length(void)
 {
-    CHECK(ROW_COUNT == 9);  // 12..20 px
-    CHECK(READER_FONT_DEFAULT_SIZE >= READER_FONT_MIN_SIZE);
-    CHECK(READER_FONT_DEFAULT_SIZE <= READER_FONT_MAX_SIZE);
+    // Seven selectable sizes: 17 px and 19 px would only duplicate the upscaled
+    // glyphs 18 px and 20 px already render more cleanly.
+    CHECK(ROW_COUNT == 7);
+    CHECK(reader_layout_size_valid(READER_FONT_DEFAULT_SIZE) == 1);
+    CHECK(g_reader_font_sizes[0] == READER_FONT_MIN_SIZE);
+    CHECK(g_reader_font_sizes[ROW_COUNT - 1] == READER_FONT_MAX_SIZE);
 }
 
 static void test_rows_are_consistent(void)
 {
     for (int i = 0; i < ROW_COUNT; ++i) {
         const reader_font_metrics_t *m = &g_reader_font_metrics[i];
-        // One row per size, in order, with no gaps.
-        CHECK(m->size == READER_FONT_MIN_SIZE + i);
+        // One row per selectable size, ascending, and the row's size must be
+        // the table entry the picker steps through.
+        CHECK(m->size == g_reader_font_sizes[i]);
+        if (i) CHECK(m->size > g_reader_font_sizes[i - 1]);
         // The generator emits line_height = size + 4 and the UI feeds the
         // paginator the same value as the baseline pitch, so text_line_space
         // stays 0 at every size.
@@ -157,16 +162,30 @@ static void test_clamping(void)
 
     CHECK(reader_layout_font_index(READER_FONT_MIN_SIZE) == 0);
     CHECK(reader_layout_font_index(READER_FONT_MAX_SIZE) == ROW_COUNT - 1);
-    CHECK(reader_layout_font_index(16) == 16 - READER_FONT_MIN_SIZE);
+    CHECK(reader_layout_font_index(16) == 4);
 
-    // Every in-range size maps to itself, so the settings page can print the
+    // Every SELECTABLE size maps to itself, so the settings page can print the
     // value it was given and the picker can compare it to the ruler.
-    for (int size = READER_FONT_MIN_SIZE; size <= READER_FONT_MAX_SIZE; ++size) {
+    for (int i = 0; i < ROW_COUNT; ++i) {
+        int size = g_reader_font_sizes[i];
         CHECK(reader_layout_metrics(size)->size == size);
+        CHECK(reader_layout_font_index(size) == i);
+        CHECK(reader_layout_font_size(i) == size);
         CHECK(reader_layout_size_valid(size) == 1);
     }
+    // The two removed sizes must be reported invalid (a stale NVS value is
+    // replaced) and snap to a neighbour rather than to a missing font.
+    CHECK(reader_layout_size_valid(17) == 0);
+    CHECK(reader_layout_size_valid(19) == 0);
+    CHECK(reader_layout_font_index(17) == 4 || reader_layout_font_index(17) == 5);
+    CHECK(reader_layout_metrics(19)->size == 18 || reader_layout_metrics(19)->size == 20);
     CHECK(reader_layout_size_valid(READER_FONT_MIN_SIZE - 1) == 0);
     CHECK(reader_layout_size_valid(READER_FONT_MAX_SIZE + 1) == 0);
+    // Stepping by table position is the only way to walk the ladder.
+    for (int i = 0; i + 1 < ROW_COUNT; ++i) {
+        int next = reader_layout_font_size(reader_layout_font_index(g_reader_font_sizes[i]) + 1);
+        CHECK(next == g_reader_font_sizes[i + 1]);
+    }
 }
 
 int main(void)

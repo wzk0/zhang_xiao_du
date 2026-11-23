@@ -94,6 +94,11 @@ run_static_checks() {
         tests/test_reader_layout.c main/reader_layout.c main/reader_text.c \
         -o "${test_dir}/test_reader_layout"
     "${test_dir}/test_reader_layout"
+    # Page map behind the footer counter and the TOC page tab.
+    "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
+        tests/test_reader_pagemap.c main/reader_pagemap.c \
+        -o "${test_dir}/test_reader_pagemap"
+    "${test_dir}/test_reader_pagemap"
     "${CC:-cc}" -std=c11 -Wall -Wextra -Werror -Imain \
         tests/test_reader_storage.c main/reader_storage.c \
         -o "${test_dir}/test_reader_storage"
@@ -108,6 +113,7 @@ run_static_checks() {
         -Itests/reader_app_stubs -Imain -Icomponents/uzlib \
         tests/test_reader_app_navigation.c \
         main/reader_text.c main/reader_layout.c main/reader_storage.c \
+        main/reader_pagemap.c main/reader_settings.c \
         main/reader_progress.c main/reader_bookmark.c \
         main/builtin_books.c main/builtin_books_data.c main/reader_zdx.c \
         components/uzlib/tinflate.c components/uzlib/crc32.c \

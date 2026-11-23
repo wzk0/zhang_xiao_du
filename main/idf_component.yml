@@ -1,0 +1,7 @@
+dependencies:
+  idf: ">=5.5.3,<5.6.0"
+  # The book store needs a filesystem with a smaller metadata footprint than
+  # SPIFFS (which reserves one 256 B lookup page per 4 KiB block, ~8% of the
+  # partition) and with UTF-8 byte-wise names, so Chinese book titles keep their
+  # ids. LittleFS gives back most of that space and is power-loss safe.
+  joltwallet/littlefs: "^1.20.0"
